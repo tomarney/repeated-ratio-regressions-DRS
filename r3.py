@@ -361,40 +361,25 @@ def drs_complete(error=False, error_message="Finished!"):
     drs.finished()
 
 
-def fit_regression_for_block(
+def get_block_regression_data(
     block: RMBlock, el_name, ca_channel_name, selected_rms=None, min_rms_per_block=2
 ):
     """
-    Fit single regression for the element/Ca ratio in one standards block.
-    
-    Requires at least min_rms_per_block *different* RM types in the block.
-
-    Args:
-        block: RMBlock object containing RM Selections (possibly multiple per RM)
-        el_name: str. Element name for the ratio (e.g., "Sr88")
-        ca_channel_name: str. Calcium channel for the ratio (e.g., "Ca43")
-        selected_rms: list of str. Standards to use in the fit (optional)
-
-    Returns: dict {slope, intercept, r_squared, slope_unc, intercept_unc} or None
+    Gathers RM stats then calculates ODR fit for a single RM block.
+    Returns dict: fit params and data, used in both DRS and UI flow.
     """
     rm_data = []
     valid_rm_names = []
-    
-    # Iterate over all RM types and their selections in this block
+
     for rm_group_name, sel_list in block.rm_sels.items():
         if selected_rms is not None and rm_group_name not in selected_rms:
             continue
-        
-        rm_stats = []
-        # Gather stats for each selection of this RM (may be multiple)
+
         for sel in sel_list:
             stats = gather_ratio_stats(el_name, ca_channel_name, selection=sel)
             if stats:
-                rm_stats.append(stats)
-
-        if rm_stats:
-            valid_rm_names.append(rm_group_name)
-            rm_data.extend(rm_stats)
+                rm_data.append(stats)
+                valid_rm_names.append(rm_group_name)
 
     if len(set(valid_rm_names)) < min_rms_per_block:
         return None
@@ -406,11 +391,21 @@ def fit_regression_for_block(
     intercept_unc = odr_out.sd_beta[1] if hasattr(odr_out, "sd_beta") else 0.0
 
     return {
-        "slope": float(odr_out.beta[0]),
-        "intercept": float(odr_out.beta[1]),
-        "r_squared": float(r_sq),
-        "slope_unc": float(slope_unc),
-        "intercept_unc": float(intercept_unc),
+        "fit": {
+            "slope": float(odr_out.beta[0]),
+            "intercept": float(odr_out.beta[1]),
+            "r_squared": float(r_sq),
+            "slope_unc": float(slope_unc),
+            "intercept_unc": float(intercept_unc),
+        },
+        "data": {
+            "x": x,
+            "y": y,
+            "x_err": x_err,
+            "y_err": y_err,
+            "rm_names": valid_rm_names,
+            "raw_stats": rm_data,
+        },
     }
 
 
@@ -420,7 +415,7 @@ def fit_regressions_for_all_blocks(
     """
     Fit regressions for all blocks and elements.
 
-    Applies `fit_regression_for_block()` to each block in the session
+    Applies `get_block_regression_data()` to each block in the session
 
     Args:
         blocks: list of RMBlock objects
@@ -458,19 +453,18 @@ def fit_regressions_for_all_blocks(
                 )
                 continue
 
-            fit_result = fit_regression_for_block(
+            result = get_block_regression_data(
                 block,
                 el_name,
                 ca_channel_name,
                 selected_rms,
                 min_rms_per_block=min_rms_per_block,
             )
-            if fit_result is None:
-                IoLog.warning(
-                    f"Could not fit {el_name}/Ca for block {block_num}"
-                )
+            if result is None:
+                IoLog.warning(f"Could not fit {el_name}/Ca for block {block_num}")
                 continue
 
+            fit_result = result["fit"]
             times.append(block.time)
             slopes.append(fit_result["slope"])
             intercepts.append(fit_result["intercept"])
@@ -1290,67 +1284,37 @@ def settingsWidget():
         block_fit_lines = []
 
         for block_idx, block in enumerate(blocks):
-            # Get stats for this block using the specific selections in block.rm_sels
-            block_data = []
-            block_rm_names = []
-
-            for rm_group_name, sel_list in block.rm_sels.items():
-                # Only include RMs that are in selected_rms
-                if rm_group_name not in selected_rms:
-                    continue
-
-                # Handle multiple selections per RM
-                for sel in sel_list:
-                    stats = gather_ratio_stats(target_el, ca_chan, selection=sel)
-                    if stats:
-                        block_data.append(stats)
-                        block_rm_names.append(rm_group_name)
-
-            if len(set(block_rm_names)) < drs.setting("MinRMsPerBlock"):
-                continue
-
-            x_vals, y_vals, x_errs, y_errs = (
-                np.array(vals) for vals in zip(*block_data)
+            result = get_block_regression_data(
+                block, target_el, ca_chan, selected_rms, drs.setting("MinRMsPerBlock")
             )
 
-            # add these vals to global list, and update the global max
-            all_x_global.extend(x_vals)
-            all_y_global.extend(y_vals)
-            max_x_global = max(all_x_global)
-            max_y_global = max(all_y_global)
+            if not result:
+                continue
 
-            block_plot_data.append((block_idx, block_data, block_rm_names))
+            fit = result["fit"]
+            data = result["data"]
 
-            # Fit and store line for this block
-            try:
-                odr_out, r_sq = fit_odr(x_vals, y_vals, x_errs, y_errs)
+            all_x_global.extend(data["x"])
+            all_y_global.extend(data["y"])
+            max_x_global = max(all_x_global) if all_x_global else 0.0
+            max_y_global = max(all_y_global) if all_y_global else 0.0
 
-                max_x = np.max(x_vals) * 1.1
-                x_range = np.linspace(0, max_x, 50)
-                y_fit = lm(odr_out.beta, x_range)
+            block_plot_data.append((block_idx, data["raw_stats"], data["rm_names"]))
 
-                slope_unc = odr_out.sd_beta[0] if hasattr(odr_out, "sd_beta") else 0.0
-                intercept_unc = (
-                    odr_out.sd_beta[1] if hasattr(odr_out, "sd_beta") else 0.0
-                )
+            max_x = np.max(data["x"]) * 1.1
+            x_range = np.linspace(0, max_x, 50)
+            y_fit = lm([fit["slope"], fit["intercept"]], x_range)
 
-                block_fit_lines.append(
-                    {
-                        "idx": block_idx,
-                        "x": x_range,
-                        "y": y_fit,
-                        "color": block_colors[block_idx],
-                        "slope": float(odr_out.beta[0]),
-                        "intercept": float(odr_out.beta[1]),
-                        "slope_unc": float(slope_unc),
-                        "intercept_unc": float(intercept_unc),
-                        "r_squared": float(r_sq),
-                    }
-                )
-            except Exception as e:
-                print(f"Failed to fit block {block_idx}: {e}")
+            block_fit_lines.append(
+                {
+                    "idx": block_idx,
+                    "x": x_range,
+                    "y": y_fit,
+                    "color": block_colors[block_idx],
+                    **fit,  # slope, intercept, r_squared
+                }
+            )
 
-        # Resolve view selection
         view_text = ratioViewCombo.currentText
         show_overview = view_text == "Overview"
         fit_index = None
