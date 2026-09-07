@@ -4,7 +4,7 @@
 #/ Authors: Thomas Arney
 #/ Description: Calibration by time-varying regressions of measured and reference molar ratios.
 #/ References: Tang et al. (2025, JAAS) DOI: 10.1039/D5JA00333D
-#/ Version: 0.4
+#/ Version: 0.5
 #/ Contact: t.arney@soton.ac.uk
 
 
@@ -18,16 +18,17 @@
 #     IoLog,
 # )
 
-from iolite import QtGui, QtCore
-from iolite.Qt import Qt, QColor
+import re
+from functools import partial
+
+import numpy as np
+from iolite import QtCore, QtGui
+from iolite.Qt import QColor, Qt
+from iolite.QtGui import QAction, QPen
+from iolite.ui import CommonUIPyInterface as CUI
 from iolite.ui import IolitePlotPyInterface as Plot
 from iolite.ui import IolitePlotSettingsDialog as PlotSettings
 from iolite.ui import QCPErrorBars, QCPRange
-from iolite.QtGui import QAction, QPen
-from iolite.ui import CommonUIPyInterface as CUI
-from functools import partial
-import numpy as np
-import re
 from scipy import odr
 
 RM_COLOR_MAP = {}
@@ -69,7 +70,7 @@ class RMBlock:
     """
     Represents a block of standards in a standard-sample-standard protocol.
     Contains RM selections (measurements) to be used for the regression.
-    
+
     Each RM can appear multiple times within a block if measurements are contiguous.
     """
 
@@ -261,16 +262,6 @@ def filter_elements_to_available(selected_elements, allInputChannels):
     return filtered, elements_tuples
 
 
-def get_baseline_group():
-    """Get the baseline selection group."""
-    baseline_grps = data.selectionGroupList(1)  # 1 = Baseline
-    if baseline_grps is None or len(baseline_grps) == 0:
-        return None
-    if len(baseline_grps) > 1:
-        IoLog.warning("Multiple baseline groups found. Using the first one.")
-    return baseline_grps[0]
-
-
 def create_mask(isMaskDefined, maskChannel, cutoff, trim, indexChannel):
     """Create mask using iolite's cutoff function"""
     if isMaskDefined:
@@ -283,6 +274,26 @@ def create_mask(isMaskDefined, maskChannel, cutoff, trim, indexChannel):
     return mask
 
 
+def subtract_baselines(indexChannel, maskOption, maskChannel, cutoff, trim):
+    """Wrapper around iolite baselineSubtract() to handle missing baseline group"""
+
+    baseline_grps = data.selectionGroupList(1)  # 1 = Baseline
+    if baseline_grps is None or len(baseline_grps) == 0:
+        drs_complete(error=True, error_message="No baseline group found.")
+        return False
+    if len(baseline_grps) > 1:
+        IoLog.warning("Multiple baseline groups found. Using the first one.")
+    bl_grp = baseline_grps[0]
+
+    mask = np.ones_like(indexChannel.data())
+
+    if maskOption:
+        mask = create_mask(maskOption, maskChannel, cutoff, trim, indexChannel)
+
+    drs.baselineSubtract(bl_grp, data.timeSeriesList(data.Input), mask, 5, 6)
+    return True
+
+
 def calc_raw_ratios(ca_channel_name, selected_elements, indexChannel):
     """
     Calculate raw element/Ca ratios from baseline-subtracted CPS channels.
@@ -293,26 +304,6 @@ def calc_raw_ratios(ca_channel_name, selected_elements, indexChannel):
 
     ca_cps_name = f"{ca_channel_name}_CPS"
 
-    # Check if CPS channels exist. if not, run baseline subtraction
-    try:
-        data.timeSeries(ca_cps_name)
-    except Exception:
-        # CPS channels don't exist. Go baseline subtract
-        try:
-            bl_grp = get_baseline_group()
-            if not bl_grp:
-                IoLog.error("Cannot compute raw ratios: no baseline group found.")
-                return False
-
-            # mask needed for baseline subtraction. just use a temprary all-true mask here
-            mask = np.ones_like(indexChannel.data())
-            allInputChannels = data.timeSeriesList(data.Input)
-            drs.baselineSubtract(bl_grp, allInputChannels, mask, 5, 30)
-        except Exception as e:
-            # some other failure not related to a missing baseline group
-            IoLog.error(f"Baseline subtraction failed: {e}")
-            return False
-
     try:
         ca_data = data.timeSeries(ca_cps_name).data()
     except Exception as e:
@@ -321,7 +312,7 @@ def calc_raw_ratios(ca_channel_name, selected_elements, indexChannel):
         )
         return False
 
-    # Baseline-subtracted channels should exist now, so calc El/Ca ratios:
+    # calc El/Ca ratios from baseline-subtracted CPS channels
 
     ca_mass_match = re.search(r"(\d+)", ca_channel_name)
     ca_mass = (
@@ -361,40 +352,25 @@ def drs_complete(error=False, error_message="Finished!"):
     drs.finished()
 
 
-def fit_regression_for_block(
+def get_block_regression_data(
     block: RMBlock, el_name, ca_channel_name, selected_rms=None, min_rms_per_block=2
 ):
     """
-    Fit single regression for the element/Ca ratio in one standards block.
-    
-    Requires at least min_rms_per_block *different* RM types in the block.
-
-    Args:
-        block: RMBlock object containing RM Selections (possibly multiple per RM)
-        el_name: str. Element name for the ratio (e.g., "Sr88")
-        ca_channel_name: str. Calcium channel for the ratio (e.g., "Ca43")
-        selected_rms: list of str. Standards to use in the fit (optional)
-
-    Returns: dict {slope, intercept, r_squared, slope_unc, intercept_unc} or None
+    Gathers RM stats then calculates ODR fit for a single RM block.
+    Returns dict: fit params and data, used in both DRS and UI flow.
     """
     rm_data = []
     valid_rm_names = []
-    
-    # Iterate over all RM types and their selections in this block
+
     for rm_group_name, sel_list in block.rm_sels.items():
         if selected_rms is not None and rm_group_name not in selected_rms:
             continue
-        
-        rm_stats = []
-        # Gather stats for each selection of this RM (may be multiple)
+
         for sel in sel_list:
             stats = gather_ratio_stats(el_name, ca_channel_name, selection=sel)
             if stats:
-                rm_stats.append(stats)
-
-        if rm_stats:
-            valid_rm_names.append(rm_group_name)
-            rm_data.extend(rm_stats)
+                rm_data.append(stats)
+                valid_rm_names.append(rm_group_name)
 
     if len(set(valid_rm_names)) < min_rms_per_block:
         return None
@@ -406,11 +382,21 @@ def fit_regression_for_block(
     intercept_unc = odr_out.sd_beta[1] if hasattr(odr_out, "sd_beta") else 0.0
 
     return {
-        "slope": float(odr_out.beta[0]),
-        "intercept": float(odr_out.beta[1]),
-        "r_squared": float(r_sq),
-        "slope_unc": float(slope_unc),
-        "intercept_unc": float(intercept_unc),
+        "fit": {
+            "slope": float(odr_out.beta[0]),
+            "intercept": float(odr_out.beta[1]),
+            "r_squared": float(r_sq),
+            "slope_unc": float(slope_unc),
+            "intercept_unc": float(intercept_unc),
+        },
+        "data": {
+            "x": x,
+            "y": y,
+            "x_err": x_err,
+            "y_err": y_err,
+            "rm_names": valid_rm_names,
+            "raw_stats": rm_data,
+        },
     }
 
 
@@ -420,7 +406,7 @@ def fit_regressions_for_all_blocks(
     """
     Fit regressions for all blocks and elements.
 
-    Applies `fit_regression_for_block()` to each block in the session
+    Applies `get_block_regression_data()` to each block in the session
 
     Args:
         blocks: list of RMBlock objects
@@ -458,19 +444,18 @@ def fit_regressions_for_all_blocks(
                 )
                 continue
 
-            fit_result = fit_regression_for_block(
+            result = get_block_regression_data(
                 block,
                 el_name,
                 ca_channel_name,
                 selected_rms,
                 min_rms_per_block=min_rms_per_block,
             )
-            if fit_result is None:
-                IoLog.warning(
-                    f"Could not fit {el_name}/Ca for block {block_num}"
-                )
+            if result is None:
+                IoLog.warning(f"Could not fit {el_name}/Ca for block {block_num}")
                 continue
 
+            fit_result = result["fit"]
             times.append(block.time)
             slopes.append(fit_result["slope"])
             intercepts.append(fit_result["intercept"])
@@ -651,7 +636,7 @@ def find_rm_blocks():
     the mean gap across all RM selections, multiplied by a tuning factor.
     Inspired by the "simple" detection method in the "3D Trace Elements" DRS,
     but with a configurable cutoff.
-    
+
     Returns: list of RMBlock objects sorted by time, or empty list if no blocks found
     """
     selections = []
@@ -709,10 +694,10 @@ def find_rm_blocks():
             current_block_sels[group_name].append(sel)
 
         blocks.append(RMBlock(block_time, current_block_sels))
-    
+
     if not blocks:
         IoLog.error("No RM blocks detected in session.")
-    
+
     return blocks
 
 
@@ -748,30 +733,22 @@ def runDRS():
         drs_complete(error=True, error_message="Settings error. See messages.")
         return
 
+    selected_elements, elements = filter_elements_to_available(
+        selected_elements, data.timeSeriesList(data.Input)
+    )
+    if not selected_elements:
+        drs_complete(error=True, error_message="No valid elements selected.")
+        return
+
     drs.setIndexChannel(indexChannel)
-    drs.message("Making mask")
-    mask = create_mask(maskOption, maskChannel, cutoff, trim, indexChannel)
     drs.progress(5)
 
     #
     # Step 2: Baseline subtraction
     # ===========================
     drs.message("Baseline subtracting")
-    allInputChannels = data.timeSeriesList(data.Input)
-    selected_elements, elements = filter_elements_to_available(
-        selected_elements, allInputChannels
-    )
-    if not selected_elements:
-        drs_complete(error=True, error_message="No valid elements selected.")
-        return
-
-    baseline_grp = get_baseline_group()
-    if not baseline_grp:
-        drs_complete(error=True, error_message="No baseline group found.")
-        return
-
-    drs.baselineSubtract(baseline_grp, allInputChannels, mask, 5, 30)
-    drs.progress(30)
+    subtract_baselines(indexChannel, maskOption, maskChannel, cutoff, trim)
+    drs.progress(10)
 
     #
     # Step 3: Calculate raw ratios
@@ -780,7 +757,7 @@ def runDRS():
     raw_ratios_ok = calc_raw_ratios(ca_channel, selected_elements, indexChannel)
     if not raw_ratios_ok:
         return
-    drs.progress(50)
+    drs.progress(15)
 
     #
     # Step 4: Detect RM blocks
@@ -799,7 +776,7 @@ def runDRS():
     #
     # Step 5: Fit regressions
     # ===========================
-    drs.progress(60)
+    drs.progress(30)
     drs.message("Fitting regressions to each standards block")
 
     regr_results = fit_regressions_for_all_blocks(
@@ -815,7 +792,7 @@ def runDRS():
         )
         return
 
-    drs.progress(70)
+    drs.progress(60)
 
     #
     # Step 6: Calibrate raw ratios
@@ -859,6 +836,8 @@ def runDRS():
 # UI stuff
 # ************************************
 
+# Tip: much easier to see if you fold to level 2 (Ctrl+K, Ctrl+2 in VSCode)
+
 
 class InputChannelsMenu(QtGui.QMenu):
     selectionChanged = QtCore.Signal(list)
@@ -895,533 +874,764 @@ class InputChannelsMenu(QtGui.QMenu):
         self.selectionChanged.emit(self.current_selection)
 
 
-def settingsWidget():
+class R3SettingsWidget(QtGui.QWidget):
     """
-    Construct the user interface.
+    Main UI widget.
     """
-    # Create an outer widget to handle centering
-    outerWidget = QtGui.QWidget()
-    outerLayout = QtGui.QHBoxLayout()
-    outerWidget.setLayout(outerLayout)
-    # Align the content of the layout to the center
-    outerLayout.setAlignment(Qt.AlignHCenter)
-    outerWidget.setStyleSheet("font-size: 10pt;")
 
-    # Create the main content widget with fixed max width
-    widget = QtGui.QWidget()
-    widget.setMaximumWidth(1000)
-    # Ensure the widget attempts to fill the available space up to max width
-    widget.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Preferred)
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
-    mainLayout = QtGui.QVBoxLayout()
-    widget.setLayout(mainLayout)
+        self.rmNames = data.selectionGroupNames(data.ReferenceMaterial)
+        self.timeSeriesNames = data.timeSeriesNames(data.Input)
 
-    # Add main content widget to outer layout
-    outerLayout.addWidget(widget)
+        self.allElementNames = [
+            ch.name
+            for ch in data.timeSeriesList(data.Input)
+            if not (ch.name.startswith("Ca") or ch.name.startswith("TotalBeam"))
+        ]
 
-    # --- Setup Global Colours ---
-    rmNames = data.selectionGroupNames(data.ReferenceMaterial)
-    for rm in rmNames:
-        get_color(rm)
-
-    # Identify default secondary RM (JCp...)
-    default_sec_rm = ""
-    for r in rmNames:
-        if "jcp" in r.lower():
-            default_sec_rm = r
-            break
-    if not default_sec_rm and rmNames:
-        default_sec_rm = rmNames[0]
-
-    # --- Get list of channels in this session ---
-    timeSeriesNames = data.timeSeriesNames(data.Input)
-    defaultChannelName = ""
-    if timeSeriesNames:
-        defaultChannelName = timeSeriesNames[0]
-
-    caChannels = [c for c in timeSeriesNames if c.startswith("Ca4")]
-    defaultCa = caChannels[0] if caChannels else defaultChannelName
-
-    # --- Default Settings ---
-    allElementNames = [
-        ch.name
-        for ch in data.timeSeriesList(data.Input)
-        if not (ch.name.startswith("Ca") or ch.name.startswith("TotalBeam"))
-    ]
-
-    # Default settings
-    drs.setSetting("IndexChannel", defaultChannelName)
-    drs.setSetting("Mask", False)
-    drs.setSetting("MaskChannel", defaultCa)
-    drs.setSetting("MaskCutoff", 500000.0)
-    drs.setSetting("MaskTrim", 0.0)
-    drs.setSetting("CaChannel", defaultCa)
-    drs.setSetting("FixMissingUnc", True)
-    drs.setSetting("MissingUnc2RSD", 10.0)
-    drs.setSetting("MinRMsPerBlock", 2)
-    drs.setSetting("BlockDetectionSensitivity", 1.0)
-    drs.setSetting("SplineType", "StepLinear")
-
-    # Initialise Elements
-    # In the case that the user has already worked in a previous session, we want to preserve their selection
-    # but filter to available channels to be safe
-    saved_elements = drs.setting("Elements")
-    if saved_elements:
-        # Filter saved elements to only include currently available ones
-        elements_to_use = [el for el in saved_elements if el in allElementNames]
-    else:
-        # First run: use all available elements
-        elements_to_use = allElementNames
-    drs.setSetting("Elements", elements_to_use)
-
-    # do the same for RM selections: preserve previous but default to all RMs for all elements if not set
-    current_rm_sel = drs.setting("RMSelections")
-    if not current_rm_sel:
-        # Default to all RMs for all elements
-        default_dict = {}
-        for el in allElementNames:
-            default_dict[el] = rmNames
-        drs.setSetting("RMSelections", default_dict)
-    else:
-        # Filter existing selections to only include current RMs
-        filtered_rm_dict = {}
-        for el, sel_list in current_rm_sel.items():
-            filtered_sel_list = [sel for sel in sel_list if sel in rmNames]
-            filtered_rm_dict[el] = filtered_sel_list
-        drs.setSetting("RMSelections", filtered_rm_dict)
-
-    settings = drs.settings()
-
-    # --- Initial Setup: Baseline Subtraction and Raw Ratios ---
-    # Ensure both CPS channels and raw ratio channels exist for the preview
-    try:
-        # calc_raw_ratios will handle baseline subtraction if CPS channels don't exist
-        ca_channel = settings["CaChannel"]
-        idx_name = settings["IndexChannel"]
-        if idx_name:
-            idx_ch = data.timeSeries(idx_name)
-            drs.setIndexChannel(idx_ch)
-
-            selected_elements, elements = filter_elements_to_available(
-                settings["Elements"], data.timeSeriesList(data.Input)
-            )
-            QtGui.QApplication.processEvents()
-
-            calc_raw_ratios(ca_channel, selected_elements, idx_ch)
-
-    except Exception as e:
-        IoLog.error(
-            f"Failed to run initial setup for DRS. See the messages tab for details."
+        self.caChannels = [c for c in self.timeSeriesNames if c.startswith("Ca4")]
+        self.defaultChannelName = (
+            self.timeSeriesNames[0] if self.timeSeriesNames else ""
+        )
+        self.defaultCa = (
+            self.caChannels[0] if self.caChannels else self.defaultChannelName
         )
 
-    # --- Notes ---
-    note = QtGui.QLabel(
-        "Note: This DRS calculates E/Ca ratios in the units stored in the reference material database. "
-        + "Make sure all values are in the appropriate units and consistent between RMs before running the DRS. "
-        + "Iolite interprets uncertainties in the reference material values as 2 standard deviations."
-    )
-    note.setWordWrap(True)
-    mainLayout.addWidget(note)
+        self.init_default_settings()
+        self.run_initial_setup()
+        self.setup_ui()
+        self.connect_signals()
+        QtGui.QApplication.processEvents()
 
-    mainLayout.addSpacing(20)  # Vertical space
+    def init_default_settings(self):
+        drs.setSetting("IndexChannel", self.defaultChannelName)
+        drs.setSetting("Mask", False)
+        drs.setSetting("MaskChannel", self.defaultCa)
+        drs.setSetting("MaskCutoff", 500000.0)
+        drs.setSetting("MaskTrim", 0.0)
+        drs.setSetting("CaChannel", self.defaultCa)
+        drs.setSetting("FixMissingUnc", True)
+        drs.setSetting("MissingUnc2RSD", 10.0)
+        drs.setSetting("MinRMsPerBlock", 2)
+        drs.setSetting("BlockDetectionSensitivity", 1.0)
+        drs.setSetting("SplineType", "StepLinear")
 
-    # --- Split layout for calcium and elements ---
-    ecGroup = QtGui.QGroupBox("E/Ca ratios")
-    ecGroupLayout = QtGui.QHBoxLayout()
-    ecGroup.setLayout(ecGroupLayout)
-    mainLayout.addWidget(ecGroup)
+        saved_elements = drs.setting("Elements")
+        elements_to_use = (
+            [el for el in saved_elements if el in self.allElementNames]
+            if saved_elements
+            else self.allElementNames
+        )
+        drs.setSetting("Elements", elements_to_use)
 
-    ecLabel = QtGui.QLabel("Calculate these ratios:")
-    ecGroupLayout.addWidget(ecLabel)
+        current_rm_sel = drs.setting("RMSelections")
+        if not current_rm_sel:
+            drs.setSetting(
+                "RMSelections", {el: self.rmNames for el in self.allElementNames}
+            )
+        else:
+            filtered_rm_dict = {
+                el: [sel for sel in sel_list if sel in self.rmNames]
+                for el, sel_list in current_rm_sel.items()
+            }
+            drs.setSetting("RMSelections", filtered_rm_dict)
 
-    ecGroupLayout.addSpacing(10)
-
-    # ToolButton for element selection
-    elButton = QtGui.QToolButton(widget)
-    elButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-    elButton.setIcon(CUI().icon("checklist"))
-    elButton.setPopupMode(QtGui.QToolButton.InstantPopup)
-
-    # Menu
-    elMenu = InputChannelsMenu(elButton, allElementNames, settings["Elements"])
-    elButton.setMenu(elMenu)
-
-    ecGroupLayout.addWidget(elButton)
-
-    # Solidus
-    solidusLabel = QtGui.QLabel("/")
-    solidusLabel.setStyleSheet("font-size: 20px; font-weight: bold;")
-    ecGroupLayout.addWidget(solidusLabel)
-
-    # Calcium channel (denominator)
-    caComboBox = QtGui.QComboBox(widget)
-    caComboBox.addItems(caChannels)
-    caComboBox.setCurrentText(settings["CaChannel"])
-    ecGroupLayout.addWidget(caComboBox)
-
-    # Push everything to the left
-    ecGroupLayout.addStretch()
-
-    mainLayout.addSpacing(20)  # Vertical space
-
-    # --- Plotting & Preview Section ---
-    previewGroup = QtGui.QGroupBox("Regression Preview")
-    previewLayout = QtGui.QVBoxLayout()
-    previewGroup.setLayout(previewLayout)
-
-    # HBox for list and plot
-    plotAreaLayout = QtGui.QHBoxLayout()
-
-    # Left: RM list and controls
-    rmLayout = QtGui.QVBoxLayout()
-
-    # Ratio Selection (Moved here)
-    ratioRow = QtGui.QHBoxLayout()
-    ratioPlotCombo = QtGui.QComboBox(widget)
-    ratioViewCombo = QtGui.QComboBox(widget)
-    ratioViewCombo.addItems(["Overview", "Block: 1"])
-    ratioViewCombo.setCurrentIndex(0)
-    ratioRow.addWidget(ratioPlotCombo, 1)
-    ratioRow.addWidget(ratioViewCombo)
-    rmLayout.addWidget(QtGui.QLabel("Preview:"))
-    rmLayout.addLayout(ratioRow)
-    rmLayout.addSpacing(10)
-
-    rmLabel = QtGui.QLabel("Reference materials:")
-    rmLayout.addWidget(rmLabel)
-
-    RMsListWidget = QtGui.QListWidget(widget)
-    RMsListWidget.setSelectionMode(QtGui.QAbstractItemView.NoSelection)
-    RMsListWidget.setMinimumHeight(200)
-    rmLayout.addWidget(RMsListWidget)
-
-    missingUncLabel = QtGui.QLabel("* missing uncertainty in ref. value")
-    missingUncLabel.setStyleSheet("font-style: italic; font-size: 9pt;")
-    # Hidden by default, shown if needed later
-    missingUncLabel.setVisible(False)
-    rmLayout.addWidget(missingUncLabel)
-    rmLayout.setSpacing(10)
-
-    # List buttons
-    listBtnsLayout = QtGui.QHBoxLayout()
-    selAllBtn = QtGui.QPushButton("Select All")
-    deSelAllBtn = QtGui.QPushButton("Deselect All")
-    listBtnsLayout.addWidget(selAllBtn)
-    listBtnsLayout.addWidget(deSelAllBtn)
-    rmLayout.addLayout(listBtnsLayout)
-
-    # Reset button
-    resetBtn = QtGui.QPushButton("Reset all ratios")
-    resetBtn.setToolTip(
-        "Select all RMs for all ratios (except Secondary Norm RM if enabled)"
-    )
-    rmLayout.addWidget(resetBtn)
-
-    # 'Missing uncertainty' controls
-    uncCtrlLayout = QtGui.QVBoxLayout()
-    uncCtrlLayout.addSpacing(10)
-    uncCtrlLayout.setSpacing(2)
-
-    fixUncCheck = QtGui.QCheckBox("Assume relative error if missing")
-    fixUncCheck.setToolTip(
-        "If a reference value has <= 0 uncertainty, assume a relative % error."
-    )
-    fixUncCheck.setChecked(drs.setting("FixMissingUnc"))
-
-    uncInputLayout = QtGui.QHBoxLayout()
-    uncInputLayout.addWidget(QtGui.QLabel("2RSD (%):"))
-    uncSpinBox = QtGui.QDoubleSpinBox()
-    uncSpinBox.setRange(0.1, 1000.0)
-    uncSpinBox.setValue(drs.setting("MissingUnc2RSD"))
-    uncSpinBox.setEnabled(fixUncCheck.isChecked())
-    uncInputLayout.addWidget(uncSpinBox)
-
-    uncCtrlLayout.addWidget(fixUncCheck)
-    uncCtrlLayout.addLayout(uncInputLayout)
-    rmLayout.addLayout(uncCtrlLayout)
-
-    # Signals for unc controls
-    def update_unc_fix_state(b):
-        drs.setSetting("FixMissingUnc", bool(b))
-        uncSpinBox.setEnabled(bool(b))
-        updateRMListForRatio()
-
-    fixUncCheck.toggled.connect(update_unc_fix_state)
-    uncSpinBox.valueChanged.connect(
-        lambda v: (drs.setSetting("MissingUnc2RSD", float(v)), refreshPlot())
-    )
-
-    plotAreaLayout.addLayout(rmLayout)
-    plotAreaLayout.addSpacing(30)
-
-    # Right: Plot
-    PLOT.setMinimumHeight(500)
-    PLOT.setMaximumHeight(700)
-    PLOT.setMinimumWidth(500)
-    PLOT.setMaximumWidth(700)
-    plotAreaLayout.addWidget(PLOT, 1)
-
-    previewLayout.addLayout(plotAreaLayout)
-    mainLayout.addWidget(previewGroup)
-
-    # --- Functions ---
-
-    def set_all_rms_checked(state):
+    def run_initial_setup(self):
         try:
-            RMsListWidget.blockSignals(True)
-            count_prop = RMsListWidget.count
-            n = count_prop() if callable(count_prop) else count_prop
+            settings = drs.settings()
+            ca_channel = settings["CaChannel"]
+            idx_name = settings["IndexChannel"]
+            if idx_name:
+                idx_ch = data.timeSeries(idx_name)
+                drs.setIndexChannel(idx_ch)
+                selected_elements, _ = filter_elements_to_available(
+                    settings["Elements"], data.timeSeriesList(data.Input)
+                )
+                for el in selected_elements:
+                    if f"{el}_CPS" not in data.timeSeriesNames(data.Intermediate):
+                        # At least one selected element is missing CPS channel
+                        # (re)run baseline subtraction
+                        subtract_baselines(
+                            idx_ch,
+                            settings["Mask"],
+                            data.timeSeries(settings["MaskChannel"]),
+                            settings["MaskCutoff"],
+                            settings["MaskTrim"],
+                        )
+                        break
 
+                for el in selected_elements:
+                    if f"{el}_{ca_channel}_Raw" not in data.timeSeriesNames(
+                        data.Intermediate
+                    ):
+                        # At least one selected element is missing raw ratio channel
+                        calc_raw_ratios(ca_channel, selected_elements, idx_ch)
+                        break
+        except Exception as e:
+            IoLog.warning(f"Failed to run initial setup for DRS: {e}")
+
+    def setup_ui(self):
+        """Coordinates the layout and adds widgets to the main window."""
+        # Outer layout (centering)
+        outerLayout = QtGui.QHBoxLayout(self)
+        outerLayout.setAlignment(Qt.AlignHCenter)
+        self.setStyleSheet("font-size: 10pt;")
+
+        # Main content widget
+        self.contentWidget = QtGui.QWidget()
+        self.contentWidget.setMaximumWidth(1000)
+        self.contentWidget.setSizePolicy(
+            QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Preferred
+        )
+        self.mainLayout = QtGui.QVBoxLayout(self.contentWidget)
+        outerLayout.addWidget(self.contentWidget)
+
+        for rm in self.rmNames:
+            get_color(rm)
+
+        note = QtGui.QLabel(
+            "Note: This DRS calculates E/Ca ratios in the units stored in the reference material database. "
+            "Make sure all values are in the appropriate units and consistent between RMs before running the DRS. "
+            "Iolite interprets uncertainties in the reference material values as 2 standard deviations."
+        )
+        note.setWordWrap(True)
+        self.mainLayout.addWidget(note)
+        self.mainLayout.addSpacing(20)
+
+        # --- E/Ca ratios ---
+        self.setup_eca_group()
+
+        # --- Preview ---
+        self.setup_preview_group()
+
+        # --- Time-varying regression ---
+        self.setup_regression_group()
+
+        # --- Secondary normalisation ---
+        self.setup_sec_norm_group()
+
+        # --- Bottom row (Index/Mask) ---
+        self.setup_bottom_row()
+
+    def setup_eca_group(self):
+        ecGroup = QtGui.QGroupBox("E/Ca ratios")
+        ecGroupLayout = QtGui.QHBoxLayout(ecGroup)
+
+        ecGroupLayout.addWidget(QtGui.QLabel("Calculate these ratios:"))
+        ecGroupLayout.addSpacing(10)
+
+        self.elButton = QtGui.QToolButton(self.contentWidget)
+        self.elButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.elButton.setIcon(CUI().icon("checklist"))
+        self.elButton.setPopupMode(QtGui.QToolButton.InstantPopup)
+        self.elMenu = InputChannelsMenu(
+            self.elButton, self.allElementNames, drs.setting("Elements")
+        )
+        self.elButton.setMenu(self.elMenu)
+        ecGroupLayout.addWidget(self.elButton)
+
+        solidusLabel = QtGui.QLabel("/")
+        solidusLabel.setStyleSheet("font-size: 20px; font-weight: bold;")
+        ecGroupLayout.addWidget(solidusLabel)
+
+        self.caComboBox = QtGui.QComboBox(self.contentWidget)
+        self.caComboBox.addItems(self.caChannels)
+        self.caComboBox.setCurrentText(drs.setting("CaChannel"))
+        ecGroupLayout.addWidget(self.caComboBox)
+        ecGroupLayout.addStretch()
+
+        self.mainLayout.addWidget(ecGroup)
+        self.mainLayout.addSpacing(20)
+
+    def setup_preview_group(self):
+        previewGroup = QtGui.QGroupBox("Regression Preview")
+        plotAreaLayout = QtGui.QHBoxLayout(previewGroup)
+
+        # Left side RM layout
+        rmLayout = QtGui.QVBoxLayout()
+
+        ratioRow = QtGui.QHBoxLayout()
+        self.ratioPlotCombo = QtGui.QComboBox(self.contentWidget)
+        self.ratioViewCombo = QtGui.QComboBox(self.contentWidget)
+        self.ratioViewCombo.addItems(["Overview", "Block: 1"])
+
+        ratioRow.addWidget(self.ratioPlotCombo, 1)
+        ratioRow.addWidget(self.ratioViewCombo)
+
+        rmLayout.addWidget(QtGui.QLabel("Preview:"))
+        rmLayout.addLayout(ratioRow)
+        rmLayout.addSpacing(10)
+        rmLayout.addWidget(QtGui.QLabel("Reference materials:"))
+
+        self.RMsListWidget = QtGui.QListWidget(self.contentWidget)
+        self.RMsListWidget.setSelectionMode(QtGui.QAbstractItemView.NoSelection)
+        self.RMsListWidget.setMinimumHeight(200)
+        rmLayout.addWidget(self.RMsListWidget)
+
+        self.missingUncLabel = QtGui.QLabel("* missing uncertainty in ref. value")
+        self.missingUncLabel.setStyleSheet("font-style: italic; font-size: 9pt;")
+        self.missingUncLabel.setVisible(False)
+        rmLayout.addWidget(self.missingUncLabel)
+        rmLayout.setSpacing(10)
+
+        # List buttons
+        listBtnsLayout = QtGui.QHBoxLayout()
+        self.selAllBtn = QtGui.QPushButton("Select All")
+        self.deSelAllBtn = QtGui.QPushButton("Deselect All")
+        listBtnsLayout.addWidget(self.selAllBtn)
+        listBtnsLayout.addWidget(self.deSelAllBtn)
+        rmLayout.addLayout(listBtnsLayout)
+
+        self.resetBtn = QtGui.QPushButton("Reset all ratios")
+        self.resetBtn.setToolTip("Select all RMs for all ratios")
+        rmLayout.addWidget(self.resetBtn)
+
+        # Missing uncertainty controls
+        uncCtrlLayout = QtGui.QVBoxLayout()
+        uncCtrlLayout.addSpacing(10)
+        uncCtrlLayout.setSpacing(2)
+
+        self.fixUncCheck = QtGui.QCheckBox("Assume relative error if missing")
+        self.fixUncCheck.setChecked(drs.setting("FixMissingUnc"))
+
+        uncInputLayout = QtGui.QHBoxLayout()
+        uncInputLayout.addWidget(QtGui.QLabel("2RSD (%):"))
+        self.uncSpinBox = QtGui.QDoubleSpinBox()
+        self.uncSpinBox.setRange(0.1, 1000.0)
+        self.uncSpinBox.setValue(drs.setting("MissingUnc2RSD"))
+        self.uncSpinBox.setEnabled(self.fixUncCheck.isChecked())
+
+        uncInputLayout.addWidget(self.uncSpinBox)
+        uncCtrlLayout.addWidget(self.fixUncCheck)
+        uncCtrlLayout.addLayout(uncInputLayout)
+        rmLayout.addLayout(uncCtrlLayout)
+
+        plotAreaLayout.addLayout(rmLayout)
+        plotAreaLayout.addSpacing(30)
+
+        # Right hand side plot
+        PLOT.setMinimumHeight(500)
+        PLOT.setMaximumHeight(700)
+        PLOT.setMinimumWidth(500)
+        PLOT.setMaximumWidth(700)
+        plotAreaLayout.addWidget(PLOT, 1)
+
+        self.mainLayout.addWidget(previewGroup)
+        self.mainLayout.addSpacing(20)
+
+    def setup_regression_group(self):
+        tsrGroup = QtGui.QGroupBox("Time-varying regression")
+        tsrLayout = QtGui.QVBoxLayout(tsrGroup)
+
+        tsrLabel = QtGui.QLabel(
+            "Fit regressions to blocks of reference materials, then interpolate with splines..."
+        )
+        tsrLabel.setWordWrap(True)
+        tsrLayout.addWidget(tsrLabel)
+
+        tsrControlsLayout = QtGui.QHBoxLayout()
+
+        # Min RMs
+        tsrControlsLayout.addWidget(QtGui.QLabel("Min RMs per block:"))
+        self.minRMsSpinBox = QtGui.QSpinBox()
+        self.minRMsSpinBox.setRange(1, 10)
+        self.minRMsSpinBox.setValue(drs.setting("MinRMsPerBlock"))
+        tsrControlsLayout.addWidget(self.minRMsSpinBox)
+        tsrControlsLayout.addSpacing(20)
+
+        # Detection sensitivity
+        tsrControlsLayout.addWidget(QtGui.QLabel("Block detection sensitivity:"))
+        self.blockDetectionSensitivitySpinBox = QtGui.QDoubleSpinBox()
+        self.blockDetectionSensitivitySpinBox.setRange(0.1, 10.0)
+        self.blockDetectionSensitivitySpinBox.setSingleStep(0.1)
+        self.blockDetectionSensitivitySpinBox.setValue(
+            drs.setting("BlockDetectionSensitivity")
+        )
+        tsrControlsLayout.addWidget(self.blockDetectionSensitivitySpinBox)
+        tsrControlsLayout.addSpacing(20)
+
+        # Spline type
+        tsrControlsLayout.addWidget(QtGui.QLabel("Spline type:"))
+        self.splineCombo = QtGui.QComboBox()
+        # no clever way I can see to get this list so just hardcode as 3DTE does
+        spline_types = [
+            "MeanMean",
+            "MeanMedian",
+            "LinearFit",
+            "WeightedLinearFit",
+            "StepLinear",
+            "StepForward",
+            "StepBackward",
+            "StepAverage",
+            "Nearest",
+            "Akima",
+            "Spline_NoSmoothing",
+            "Spline_Smooth1",
+            "Spline_Smooth2",
+            "Spline_Smooth3",
+            "Spline_Smooth4",
+            "Spline_Smooth5",
+            "Spline_Smooth6",
+            "Spline_Smooth7",
+            "Spline_Smooth8",
+            "Spline_Smooth9",
+            "Spline_Smooth10",
+            "Spline_AutoSmooth",
+        ]
+        self.splineCombo.addItems(spline_types)
+        self.splineCombo.setCurrentText(drs.setting("SplineType"))
+        tsrControlsLayout.addWidget(self.splineCombo)
+        tsrControlsLayout.addStretch()
+
+        tsrLayout.addLayout(tsrControlsLayout)
+        self.mainLayout.addWidget(tsrGroup)
+        self.mainLayout.addSpacing(30)
+
+    def setup_sec_norm_group(self):
+        secNormGroup = QtGui.QGroupBox("Secondary normalisation")
+        secNormLayout = QtGui.QVBoxLayout(secNormGroup)
+
+        secNormLayout.addWidget(
+            QtGui.QLabel(
+                "Apply a second normalisation factor derived from a reference material."
+            )
+        )
+        snHLayout = QtGui.QHBoxLayout()
+
+        self.secNormCheckBox = QtGui.QCheckBox("Enabled")
+        self.secNormCheckBox.setChecked(drs.setting("SecondaryNorm"))
+        snHLayout.addWidget(self.secNormCheckBox)
+        snHLayout.addSpacing(20)
+
+        snHLayout.addWidget(QtGui.QLabel("Measured RM:"))
+        self.secNormCombo = QtGui.QComboBox()
+        self.secNormCombo.addItems(self.rmNames)
+        self.secNormCombo.setCurrentText(drs.setting("SecondaryNormRM"))
+        snHLayout.addWidget(self.secNormCombo)
+        snHLayout.addSpacing(30)
+
+        snHLayout.addWidget(QtGui.QLabel("Reference values:"))
+        self.secNormRefCombo = QtGui.QComboBox()
+        self.secNormRefCombo.addItems(data.referenceMaterialNames())
+        self.secNormRefCombo.setCurrentText(drs.setting("SecondaryNormRefMaterial"))
+        snHLayout.addWidget(self.secNormRefCombo)
+        snHLayout.addStretch()
+
+        secNormLayout.addLayout(snHLayout)
+        self.mainLayout.addWidget(secNormGroup)
+        self.mainLayout.addSpacing(30)
+
+    def setup_bottom_row(self):
+        bottomRowLayout = QtGui.QHBoxLayout()
+
+        indexGroup = QtGui.QGroupBox("Index")
+        indexLayout = QtGui.QHBoxLayout(indexGroup)
+        indexLayout.addWidget(QtGui.QLabel("Channel:"))
+        self.indexComboBox = QtGui.QComboBox(self.contentWidget)
+        self.indexComboBox.addItems(self.timeSeriesNames)
+        self.indexComboBox.setCurrentText(drs.setting("IndexChannel"))
+        indexLayout.addWidget(self.indexComboBox)
+        bottomRowLayout.addWidget(indexGroup)
+
+        maskGroup = QtGui.QGroupBox("Mask (click Crunch Data to apply)")
+        maskLayout = QtGui.QHBoxLayout(maskGroup)
+        self.maskCheckBox = QtGui.QCheckBox("Enabled")
+        self.maskCheckBox.setChecked(drs.setting("Mask"))
+        maskLayout.addWidget(self.maskCheckBox)
+
+        maskLayout.addStretch()
+        maskLayout.addWidget(QtGui.QLabel("Channel:"))
+        self.maskChannelComboBox = QtGui.QComboBox()
+        self.maskChannelComboBox.addItems(data.timeSeriesNames(data.Input))
+        self.maskChannelComboBox.setCurrentText(drs.setting("MaskChannel"))
+        maskLayout.addWidget(self.maskChannelComboBox)
+
+        maskLayout.addStretch()
+        maskLayout.addWidget(QtGui.QLabel("Cutoff:"))
+        self.maskCutoffInput = QtGui.QLineEdit(str(drs.setting("MaskCutoff")))
+        maskLayout.addWidget(self.maskCutoffInput)
+
+        maskLayout.addStretch()
+        maskLayout.addWidget(QtGui.QLabel("Trim:"))
+        self.maskTrimInput = QtGui.QLineEdit(str(drs.setting("MaskTrim")))
+        maskLayout.addWidget(self.maskTrimInput)
+        bottomRowLayout.addWidget(maskGroup, 1)
+
+        self.mainLayout.addLayout(bottomRowLayout)
+
+        # Initialise UI state
+        self.secNormCombo.setEnabled(self.secNormCheckBox.isChecked())
+        self.secNormRefCombo.setEnabled(self.secNormCheckBox.isChecked())
+        self.on_mask_toggle_changed(self.maskCheckBox.isChecked())
+
+    def connect_signals(self):
+        """Connect the handlers for all the UI inputs"""
+        self.elMenu.selectionChanged.connect(self.on_elements_changed)
+        self.caComboBox.currentTextChanged.connect(self.on_Ca_channel_changed)
+        self.ratioPlotCombo.currentIndexChanged.connect(self.update_rm_list_for_ratio)
+        self.ratioViewCombo.currentIndexChanged.connect(self.refresh_plot)
+        self.RMsListWidget.itemChanged.connect(self.on_rm_checked_changed)
+        self.selAllBtn.clicked.connect(lambda: self.set_all_rms_checked(True))
+        self.deSelAllBtn.clicked.connect(lambda: self.set_all_rms_checked(False))
+        self.resetBtn.clicked.connect(self.reset_all_ratios)
+        self.fixUncCheck.toggled.connect(self.update_unc_fix_state)
+        self.uncSpinBox.valueChanged.connect(
+            lambda v: (drs.setSetting("MissingUnc2RSD", float(v)), self.refresh_plot())
+        )
+        self.minRMsSpinBox.valueChanged.connect(
+            lambda v: (drs.setSetting("MinRMsPerBlock", int(v)), self.refresh_plot())
+        )
+        self.blockDetectionSensitivitySpinBox.valueChanged.connect(
+            lambda v: (
+                drs.setSetting("BlockDetectionSensitivity", float(v)),
+                self.refresh_plot(),
+            )
+        )
+        self.splineCombo.currentTextChanged.connect(
+            lambda t: drs.setSetting("SplineType", t)
+        )
+        self.secNormCheckBox.toggled.connect(self.update_sec_norm_ui)
+        self.secNormCombo.currentTextChanged.connect(self.update_sec_norm_ui)
+        self.secNormRefCombo.currentTextChanged.connect(self.update_sec_norm_ui)
+        self.indexComboBox.currentTextChanged.connect(
+            lambda t: drs.setSetting("IndexChannel", t)
+        )
+        self.maskCheckBox.toggled.connect(self.on_mask_toggle_changed)
+        self.maskChannelComboBox.currentTextChanged.connect(
+            lambda t: drs.setSetting("MaskChannel", t)
+        )
+        self.maskCutoffInput.textChanged.connect(
+            lambda t: drs.setSetting("MaskCutoff", float(t))
+        )
+        self.maskTrimInput.textChanged.connect(
+            lambda t: drs.setSetting("MaskTrim", float(t))
+        )
+
+        # initial state sync
+        self.on_elements_changed(drs.setting("Elements") or self.allElementNames)
+
+    # --- UI functions ---
+    def set_all_rms_checked(self, state):
+        """Select or deselect all RMs in the currently selected ratio"""
+        try:
+            self.RMsListWidget.blockSignals(True)
+            n = self.RMsListWidget.count
             for i in range(n):
-                item = RMsListWidget.item(i)
-                item.setCheckState(Qt.Checked if state else Qt.Unchecked)
-
-            RMsListWidget.blockSignals(False)
-            save_current_rm_selection()
-            refreshPlot()
+                self.RMsListWidget.item(i).setCheckState(
+                    Qt.Checked if state else Qt.Unchecked
+                )
+            self.RMsListWidget.blockSignals(False)
+            self.save_current_rm_selection()
+            self.refresh_plot()
         except Exception as e:
             IoLog.error(f"Error selecting all: {e}")
 
-    def reset_all_ratios():
+    def reset_all_ratios(self):
+        """Select all RMs in all ratios"""
         try:
-            # Iterate all elements in settings and reset their list to full
             all_els = drs.setting("Elements")
-            full_rm_list = data.selectionGroupNames(data.ReferenceMaterial)
-
-            new_dict = {}
-            for el in all_els:
-                new_dict[el] = full_rm_list
+            new_dict = {el: self.rmNames for el in all_els}
             drs.setSetting("RMSelections", new_dict)
-            updateRMListForRatio()
+            self.update_rm_list_for_ratio()
         except Exception as e:
             IoLog.error(f"Error resetting: {e}")
 
-    # Connect buttons
-    selAllBtn.clicked.connect(lambda: set_all_rms_checked(True))
-    deSelAllBtn.clicked.connect(lambda: set_all_rms_checked(False))
-    resetBtn.clicked.connect(reset_all_ratios)
-
-    def save_current_rm_selection():
-        """Save check states of current list to settings dict"""
+    def save_current_rm_selection(self):
+        """Save the current RM selections for the currently selected ratio"""
         try:
-            curr_el = ratioPlotCombo.currentData
+            curr_el = self.ratioPlotCombo.currentData
             if not curr_el:
                 return
 
-            if callable(curr_el):
-                curr_el = curr_el()
-
             selected = []
-            count_prop = RMsListWidget.count
-            n = count_prop() if callable(count_prop) else count_prop
+            n = self.RMsListWidget.count
             for i in range(n):
-                item = RMsListWidget.item(i)
+                item = self.RMsListWidget.item(i)
                 if item.checkState() == Qt.Checked:
-                    # Use data to store clean RM name
-                    t = item.data(Qt.UserRole)
-                    selected.append(t)
+                    selected.append(item.data(Qt.UserRole))
 
-            # Update Dict
-            current_dict = drs.setting("RMSelections")
-            if current_dict is None:
-                current_dict = {}
+            current_dict = drs.setting("RMSelections") or {}
             current_dict[curr_el] = selected
             drs.setSetting("RMSelections", current_dict)
-
         except Exception as e:
             IoLog.error(f"Error saving RM selection: {e}")
 
-    def refreshPlot():
+    def on_elements_changed(self, selected):
+        """Handle the user changing which elements are selected in the dropdown"""
+        drs.setSetting("Elements", selected)
+        self.elButton.setText(f"Elements ({len(selected)} selected)")
+        self.update_ratio_combo()
+        self.update_rm_list_for_ratio()
+
+    def on_Ca_channel_changed(self, new_Ca_channel):
+        """Handle the user changing the Ca channel in the dropdown"""
+        drs.setSetting("CaChannel", new_Ca_channel)
+        calc_raw_ratios(
+            new_Ca_channel,
+            drs.setting("Elements"),
+            data.timeSeries(drs.setting("IndexChannel")),
+        )
+        self.update_ratio_combo()
+        self.refresh_plot()
+
+    def on_rm_checked_changed(self):
+        """Handle the user checking or unchecking an RM in the list"""
+        self.save_current_rm_selection()
+        self.refresh_plot()
+
+    def update_sec_norm_ui(self):
+        """Handle secondary normalisation being checked or unchecked"""
+        enabled = self.secNormCheckBox.isChecked()
+        self.secNormCombo.setEnabled(enabled)
+        self.secNormRefCombo.setEnabled(enabled)
+        drs.setSetting("SecondaryNorm", enabled)
+        drs.setSetting("SecondaryNormRM", self.secNormCombo.currentText)
+        drs.setSetting("SecondaryNormRefMaterial", self.secNormRefCombo.currentText)
+
+    def on_mask_toggle_changed(self, b):
+        """Handle mask being checked or unchecked"""
+        drs.setSetting("Mask", bool(b))
+        self.maskChannelComboBox.setEnabled(bool(b))
+        self.maskCutoffInput.setEnabled(bool(b))
+        self.maskTrimInput.setEnabled(bool(b))
+
+    def update_unc_fix_state(self, b):
+        """Handle the 'assume error if missing' checkbox being toggled"""
+        drs.setSetting("FixMissingUnc", bool(b))
+        self.uncSpinBox.setEnabled(bool(b))
+        self.update_rm_list_for_ratio()
+
+    def update_ratio_combo(self):
+        """Update the E/Ca ratio dropdown after the user changes the inputs"""
+        selected_els = drs.setting("Elements")
+        ca_channel = drs.setting("CaChannel")
+        old_sel = self.ratioPlotCombo.currentData
+
+        self.ratioPlotCombo.blockSignals(True)
+        self.ratioPlotCombo.clear()
+        for el in selected_els:
+            self.ratioPlotCombo.addItem(f"{el}/{ca_channel}", el)
+
+        idx = self.ratioPlotCombo.findData(old_sel)
+        self.ratioPlotCombo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.ratioPlotCombo.blockSignals(False)
+
+    def update_rm_list_for_ratio(self):
+        """Update the list of RMs when the user changes the selected element"""
+        self.RMsListWidget.blockSignals(True)
+        self.RMsListWidget.clear()
+
+        target_el = self.ratioPlotCombo.currentData
+        if not target_el:
+            self.RMsListWidget.blockSignals(False)
+            return
+
+        rm_dict = drs.setting("RMSelections") or {}
+        if target_el not in rm_dict:
+            rm_dict[target_el] = self.rmNames
+            drs.setSetting("RMSelections", rm_dict)
+
+        selected_for_ratio = rm_dict.get(target_el, [])
+        apply_fix_unc = drs.setting("FixMissingUnc")
+
+        has_missing_unc_any = False
+        match = re.match(r"([a-zA-Z]+)([0-9]+)", target_el)
+        ref_lookup = f"{match.group(1)}/Ca" if match else None
+
+        for name in self.rmNames:
+            item = QtGui.QListWidgetItem()  # Text set later
+            item.setData(Qt.UserRole, name)  # Store clean name
+            flags = item.flags() | Qt.ItemIsUserCheckable
+
+            pix = QtGui.QPixmap(12, 12)
+            pix.fill(get_color(name))
+
+            has_ref_val = False
+            ref_unc = 0.0
+            if ref_lookup:
+                rm_data = data.referenceMaterialData(name)
+                if ref_lookup in rm_data:
+                    has_ref_val = True
+                    ref_unc = rm_data[ref_lookup].uncertainty()
+
+            display_text = name
+            is_missing_unc = has_ref_val and (ref_unc <= 0 or np.isnan(ref_unc))
+            if is_missing_unc:
+                has_missing_unc_any = True
+                display_text += "*"
+
+            if not has_ref_val or (is_missing_unc and not apply_fix_unc):
+                item.setFlags(flags & ~Qt.ItemIsEnabled)
+                item.setCheckState(Qt.Unchecked)
+                item.setToolTip(
+                    f"{name} has no reference value for {ref_lookup} and cannot be used."
+                )
+
+                # Set icon to light grey and add question mark
+                pix.fill(QtGui.QColor(220, 220, 220))
+                painter = QtGui.QPainter(pix)
+                painter.setPen(QtGui.QColor(100, 100, 100))
+                painter.drawRect(0, 0, 11, 11)
+                painter.setPen(QtGui.QColor(Qt.red))
+                f = painter.font()
+                f.setPixelSize(10)
+                f.setBold(True)
+                painter.setFont(f)
+                painter.drawText(0, 0, 12, 12, Qt.AlignCenter, "?")
+                painter.end()
+                item.setIcon(QtGui.QIcon(pix))
+            else:
+                item.setFlags(flags | Qt.ItemIsEnabled)
+                item.setCheckState(
+                    Qt.Checked if name in selected_for_ratio else Qt.Unchecked
+                )
+                item.setIcon(QtGui.QIcon(pix))
+
+            item.setText(display_text)
+            self.RMsListWidget.addItem(item)
+
+        self.missingUncLabel.setVisible(has_missing_unc_any)
+        self.fixUncCheck.setEnabled(has_missing_unc_any)
+        self.uncSpinBox.setEnabled(has_missing_unc_any and self.fixUncCheck.isChecked())
+
+        self.RMsListWidget.blockSignals(False)
+        self.refresh_plot()
+
+    def refresh_plot(self):
+        """Update the regression preview plot after user changes inputs"""
         PLOT.clearGraphs()
         ann.visible = False
-
         ca_chan = drs.setting("CaChannel")
 
-        try:
-            target_el = ratioPlotCombo.currentData
-            if callable(target_el):
-                target_el = target_el()
-        except TypeError:
-            target_el = ratioPlotCombo.currentData
-
+        target_el = self.ratioPlotCombo.currentData
         if not target_el:
             PLOT.replot()
             return
 
-        # Get RM selections for current ratio
-        rm_dict = drs.setting("RMSelections")
-        if not rm_dict:
-            rm_dict = {}
-
-        selected_rms = rm_dict.get(target_el, [])
-
-        if not selected_rms or len(selected_rms) < 2:
-            IoLog.error("Fewer than 2 valid RMs found for regression.")
+        selected_rms = drs.setting("RMSelections").get(target_el, [])
+        if len(selected_rms) < 2:
             PLOT.replot()
             return
 
         blocks = find_rm_blocks()
         if not blocks:
-            IoLog.error("Block detection failed. Check selection groups and RM ordering.")
             return
 
-        # Update view options based on block count
-        prev_view = ratioViewCombo.currentText
-        ratioViewCombo.blockSignals(True)
-        ratioViewCombo.clear()
-        ratioViewCombo.addItem("Overview")
+        # save current ratio selection, update combobox, and restore selection if still valid
+        prev_view = self.ratioViewCombo.currentText
+        self.ratioViewCombo.blockSignals(True)
+        self.ratioViewCombo.clear()
+        self.ratioViewCombo.addItem("Overview")
         for i in range(len(blocks)):
-            ratioViewCombo.addItem(f"Block: {i+1}")
-        if prev_view in [
-            ratioViewCombo.itemText(i) for i in range(ratioViewCombo.count)
-        ]:
-            ratioViewCombo.setCurrentText(prev_view)
-        else:
-            ratioViewCombo.setCurrentIndex(0)
-        ratioViewCombo.blockSignals(False)
+            self.ratioViewCombo.addItem(f"Block: {i + 1}")
+        self.ratioViewCombo.setCurrentText(
+            prev_view
+            if prev_view
+            in [
+                self.ratioViewCombo.itemText(i)
+                for i in range(self.ratioViewCombo.count)
+            ]
+            else "Overview"
+        )
+        self.ratioViewCombo.blockSignals(False)
 
-        # Plot for each block
+        # prepare data for plotting
+        all_x_global, all_y_global = [], []
+        block_plot_data, block_fit_lines = [], []
         block_colors = [PLOT_COLOURS[i % len(PLOT_COLOURS)] for i in range(len(blocks))]
-        all_x_global = []
-        all_y_global = []
-        max_x_global = 0.0
-        max_y_global = 0.0
-        block_plot_data = []
-        block_fit_lines = []
 
         for block_idx, block in enumerate(blocks):
-            # Get stats for this block using the specific selections in block.rm_sels
-            block_data = []
-            block_rm_names = []
-
-            for rm_group_name, sel_list in block.rm_sels.items():
-                # Only include RMs that are in selected_rms
-                if rm_group_name not in selected_rms:
-                    continue
-
-                # Handle multiple selections per RM
-                for sel in sel_list:
-                    stats = gather_ratio_stats(target_el, ca_chan, selection=sel)
-                    if stats:
-                        block_data.append(stats)
-                        block_rm_names.append(rm_group_name)
-
-            if len(set(block_rm_names)) < drs.setting("MinRMsPerBlock"):
+            result = get_block_regression_data(
+                block, target_el, ca_chan, selected_rms, drs.setting("MinRMsPerBlock")
+            )
+            if not result:
                 continue
 
-            x_vals, y_vals, x_errs, y_errs = (
-                np.array(vals) for vals in zip(*block_data)
+            fit = result["fit"]
+            b_data = result["data"]
+
+            all_x_global.extend(b_data["x"])
+            all_y_global.extend(b_data["y"])
+            block_plot_data.append((block_idx, b_data["raw_stats"], b_data["rm_names"]))
+
+            max_x = np.max(b_data["x"]) * 1.1
+            x_range = np.linspace(0, max_x, 50)
+            y_fit = fit["slope"] * x_range + fit["intercept"]
+
+            block_fit_lines.append(
+                {
+                    "idx": block_idx,
+                    "x": x_range,
+                    "y": y_fit,
+                    "color": block_colors[block_idx],
+                    **fit,
+                }
             )
 
-            # add these vals to global list, and update the global max
-            all_x_global.extend(x_vals)
-            all_y_global.extend(y_vals)
-            max_x_global = max(all_x_global)
-            max_y_global = max(all_y_global)
-
-            block_plot_data.append((block_idx, block_data, block_rm_names))
-
-            # Fit and store line for this block
-            try:
-                odr_out, r_sq = fit_odr(x_vals, y_vals, x_errs, y_errs)
-
-                max_x = np.max(x_vals) * 1.1
-                x_range = np.linspace(0, max_x, 50)
-                y_fit = lm(odr_out.beta, x_range)
-
-                slope_unc = odr_out.sd_beta[0] if hasattr(odr_out, "sd_beta") else 0.0
-                intercept_unc = (
-                    odr_out.sd_beta[1] if hasattr(odr_out, "sd_beta") else 0.0
-                )
-
-                block_fit_lines.append(
-                    {
-                        "idx": block_idx,
-                        "x": x_range,
-                        "y": y_fit,
-                        "color": block_colors[block_idx],
-                        "slope": float(odr_out.beta[0]),
-                        "intercept": float(odr_out.beta[1]),
-                        "slope_unc": float(slope_unc),
-                        "intercept_unc": float(intercept_unc),
-                        "r_squared": float(r_sq),
-                    }
-                )
-            except Exception as e:
-                print(f"Failed to fit block {block_idx}: {e}")
-
-        # Resolve view selection
-        view_text = ratioViewCombo.currentText
+        view_text = self.ratioViewCombo.currentText
         show_overview = view_text == "Overview"
-        fit_index = None
-        if not show_overview:
-            try:
-                fit_index = int(view_text.split(":")[-1].strip()) - 1
-            except Exception:
-                fit_index = None
+        fit_index = None if show_overview else int(view_text.split(":")[-1].strip()) - 1
 
-        def plot_hollow_point(x_val, y_val, color, size):
+        def plot_point_with_error(x, y, x_err, y_err, color, size, hollow=True):
             g = PLOT.addGraph()
             g.setLineStyle("lsNone")
-            g.setScatterStyle("ssCircle", size, color, Qt.transparent)
-            g.setData(np.array([x_val]), np.array([y_val]))
+            g.setScatterStyle(
+                "ssCircle" if hollow else "ssDisc",
+                size,
+                color,
+                Qt.transparent if hollow else color,
+            )
+            g.setData(np.array([x]), np.array([y]))
+
+            if not hollow:
+                try:
+                    eb_x = QCPErrorBars(PLOT.bottom(), PLOT.left())
+                    eb_x.setDataPlottable(g)
+                    eb_x.errorType = QCPErrorBars.etKeyError
+                    eb_x.setData(np.array([x_err]))
+                    eb_x.pen = QPen(color)
+                    eb_x.removeFromLegend()
+                except Exception as e:
+                    IoLog.warning(f"Failed to plot X errors: {e}")
+
+                try:
+                    eb_y = QCPErrorBars(PLOT.bottom(), PLOT.left())
+                    eb_y.setDataPlottable(g)
+                    eb_y.errorType = QCPErrorBars.etValueError
+                    eb_y.setData(np.array([y_err]))
+                    eb_y.pen = QPen(color)
+                    eb_y.removeFromLegend()
+                except Exception as e:
+                    IoLog.warning(f"Failed to plot Y errors: {e}")
             return g
 
-        def plot_mean_with_errors(x_val, y_val, x_err, y_err, color, size):
-            g = PLOT.addGraph()
-            g.setLineStyle("lsNone")
-            g.setScatterStyle("ssDisc", size, color)
-            g.setData(np.array([x_val]), np.array([y_val]))
-
-            # x data
-            try:
-                eb_x = QCPErrorBars(PLOT.bottom(), PLOT.left())
-                eb_x.setDataPlottable(g)
-                eb_x.errorType = QCPErrorBars.etKeyError
-                eb_x.setData(np.array([x_err]))
-                eb_x.pen = QPen(color)
-                eb_x.removeFromLegend()
-            except:
-                pass
-
-            # y data
-            try:
-                eb_y = QCPErrorBars(PLOT.bottom(), PLOT.left())
-                eb_y.setDataPlottable(g)
-                eb_y.errorType = QCPErrorBars.etValueError
-                eb_y.setData(np.array([y_err]))
-                eb_y.pen = QPen(color)
-                eb_y.removeFromLegend()
-            except:
-                pass
-
-            return g
-
+        # plot/replot the data
+        ann_fit_data = None
         if show_overview:
-            # Plot fit lines first so points sit on top
-            for fit_line in block_fit_lines:
+            for line in block_fit_lines:
                 fg = PLOT.addGraph()
-                fg.setName(f"Block {fit_line['idx']+1}")
-                pen = QPen(fit_line["color"])
+                pen = QPen(line["color"])
                 pen.setWidth(1.5)
-                pen.setStyle(Qt.SolidLine)
                 fg.pen = pen
-                fg.setData(fit_line["x"], fit_line["y"])
+                fg.setData(line["x"], line["y"])
 
-            # Plot individual selections as hollow circles (no error bars)
-            for block_idx, block_data, block_rm_names in block_plot_data:
-                for i, (meas_mean, ref_val, meas_err, ref_err) in enumerate(block_data):
-                    rm_name = block_rm_names[i]
-                    color = get_color(rm_name)
-                    g = plot_hollow_point(meas_mean, ref_val, color, 6.0)
-                    g.setName(f"{rm_name} (Selection {block_idx+1})")
+            # plot hollow points for all blocks
+            for b_idx, stats, names in block_plot_data:
+                for (meas_mean, ref_val, _, _), name in zip(stats, names):
+                    plot_point_with_error(
+                        meas_mean,
+                        ref_val,
+                        0,
+                        0,
+                        get_color(name),
+                        6.0,
+                        True,
+                    )
 
             # Plot group means as solid circles with error bars
-            plotted_means = set()
             for rm_name in selected_rms:
-                if rm_name in plotted_means:
-                    continue
-                plotted_means.add(rm_name)
 
                 stats = gather_ratio_stats(
                     target_el, ca_chan, rm_group=data.selectionGroup(rm_name)
@@ -1430,75 +1640,49 @@ def settingsWidget():
                     continue
 
                 meas_mean, ref_val, meas_err, ref_err = stats
-                color = get_color(rm_name)
-
-                g = plot_mean_with_errors(
-                    meas_mean, ref_val, meas_err, ref_err, color, 9.0
+                plot_point_with_error(
+                    meas_mean,
+                    ref_val,
+                    meas_err,
+                    ref_err,
+                    get_color(rm_name),
+                    6.0,
+                    False,
                 )
-                g.setName(f"{rm_name} (Mean)")
 
-            # For overview, find fit with median slope to display
             if block_fit_lines:
-                median_idx = len(block_fit_lines) // 2
-                median_fit = sorted(block_fit_lines, key=lambda x: x["slope"])[
-                    median_idx
+                ann_fit_data = sorted(block_fit_lines, key=lambda x: x["slope"])[
+                    len(block_fit_lines) // 2
                 ]
-                ann_fit_data = median_fit
-            else:
-                ann_fit_data = None
         else:
-            # Individual fit view for a single block, includes error bars
-            if fit_index is None or fit_index < 0 or fit_index >= len(block_plot_data):
-                print("Selected fit view is out of range.")
-                ann_fit_data = None
-            else:
-                for fit_line in block_fit_lines:
-                    if fit_line["idx"] == fit_index:
-                        fg = PLOT.addGraph()
-                        fg.setName(f"Block {fit_line['idx']+1}")
-                        pen = QPen(fit_line["color"])
-                        pen.setWidth(1.5)
-                        pen.setStyle(Qt.SolidLine)
-                        fg.pen = pen
-                        fg.setData(fit_line["x"], fit_line["y"])
-                        ann_fit_data = fit_line
-                        break
-                else:
-                    ann_fit_data = None
+            if fit_index is not None and 0 <= fit_index < len(block_plot_data):
+                line = next((l for l in block_fit_lines if l["idx"] == fit_index), None)
+                if line:
+                    fg = PLOT.addGraph()
+                    pen = QPen(line["color"])
+                    pen.setWidth(1.5)
+                    fg.pen = pen
+                    fg.setData(line["x"], line["y"])
+                    ann_fit_data = line
 
-                block_idx, block_data, block_rm_names = block_plot_data[fit_index]
-                for i, (meas_mean, ref_val, meas_err, ref_err) in enumerate(block_data):
-                    rm_name = block_rm_names[i]
-                    color = get_color(rm_name)
-                    g = plot_hollow_point(meas_mean, ref_val, color, 6.0)
-                    g.setName(f"{rm_name} (Selection {block_idx+1})")
+                b_idx, stats, names = block_plot_data[fit_index]
+                for (meas_mean, ref_val, meas_err, ref_err), name in zip(stats, names):
+                    plot_point_with_error(
+                        meas_mean,
+                        ref_val,
+                        meas_err,
+                        ref_err,
+                        get_color(name),
+                        6.0,
+                        False,
+                    )
 
-                    # x data
-                    try:
-                        eb_x = QCPErrorBars(PLOT.bottom(), PLOT.left())
-                        eb_x.setDataPlottable(g)
-                        eb_x.errorType = QCPErrorBars.etKeyError
-                        eb_x.setData(np.array([meas_err]))
-                        eb_x.pen = QPen(color)
-                        eb_x.removeFromLegend()
-                    except:
-                        pass
-
-                    # y data
-                    try:
-                        eb_y = QCPErrorBars(PLOT.bottom(), PLOT.left())
-                        eb_y.setDataPlottable(g)
-                        eb_y.errorType = QCPErrorBars.etValueError
-                        eb_y.setData(np.array([ref_err]))
-                        eb_y.pen = QPen(color)
-                        eb_y.removeFromLegend()
-                    except:
-                        pass
-
-        ann.visible = True
+        # Annotate and scale axes
+        if ann_fit_data:
+            ann.visible = True
 
         # Build annotation text with ODR parameters
-        view_label = "overview" if show_overview else f"block {fit_index+1}"
+        view_label = "overview" if show_overview else f"block {fit_index + 1}"
         ann_text = f'<p style="color:black;font-size:9pt;line-height:1.15;"><b>{target_el}/{ca_chan}</b> ({view_label})'
 
         if ann_fit_data is not None:
@@ -1521,447 +1705,16 @@ def settingsWidget():
         ann.text = ann_text
 
         PLOT.rescaleAxes()
-
-        # Start axes at 0, keep global ranges across views when available
-        if max_x_global > 0 or max_y_global > 0:
-            upper_x = max_x_global * 1.2
-            upper_y = max_y_global * 1.2
-        else:
-            y_range = PLOT.left().range
-            upper_y = y_range.upper() * 1.2
-            x_range = PLOT.bottom().range
-            upper_x = x_range.upper() * 1.2
-
-        PLOT.left().setRange(QCPRange(0, upper_y))
-        PLOT.bottom().setRange(QCPRange(0, upper_x))
+        if all_x_global:
+            PLOT.left().setRange(QCPRange(0, max(all_y_global) * 1.2))
+            PLOT.bottom().setRange(QCPRange(0, max(all_x_global) * 1.2))
 
         PLOT.replot()
-        return
 
-    def updateRMListForRatio():
-        """Populate the RM list based on the selected ratio/element"""
-        RMsListWidget.blockSignals(True)
-        RMsListWidget.clear()
 
-        try:
-            target_el = ratioPlotCombo.currentData
-            if callable(target_el):
-                target_el = target_el()
-        except:
-            target_el = None
-
-        if not target_el:
-            RMsListWidget.blockSignals(False)
-            return
-
-        rm_dict = drs.setting("RMSelections")
-        if not rm_dict:
-            rm_dict = {}
-
-        # If this element isn't in dict yet, add it with all RMs
-        if target_el not in rm_dict:
-            rm_dict[target_el] = rmNames
-            drs.setSetting("RMSelections", rm_dict)
-
-        selected_for_ratio = rm_dict.get(target_el, [])
-
-        apply_fix_unc = drs.setting("FixMissingUnc")
-
-        dict_modified = False
-        has_missing_unc_any = False  # Track if any RM has missing uncertainty
-
-        # Prepare regex for Element/Mass parsing to look up reference value
-        match = re.match(r"([a-zA-Z]+)([0-9]+)", target_el)
-        ref_lookup = None
-        if match:
-            el_sym = match.group(1)
-            ref_lookup = f"{el_sym}/Ca"
-
-        for name in rmNames:
-            item = QtGui.QListWidgetItem()  # Text set later
-            item.setData(Qt.UserRole, name)  # Store clean name
-
-            flags = item.flags() | Qt.ItemIsUserCheckable
-
-            # Simple square with fill colour
-            base_color = get_color(name)
-            pix = QtGui.QPixmap(12, 12)
-            pix.fill(base_color)
-
-            is_checked = name in selected_for_ratio
-
-            # Check if RM has reference value
-            has_ref_val = False
-            ref_unc = 0.0
-
-            if ref_lookup:
-                rm_data = data.referenceMaterialData(name)
-                if ref_lookup in rm_data:
-                    has_ref_val = True
-                    ref_unc = rm_data[ref_lookup].uncertainty()
-
-            display_text = name
-
-            # Determine specific conditions
-            is_missing_unc = False
-            if has_ref_val and (ref_unc <= 0 or np.isnan(ref_unc)):
-                is_missing_unc = True
-                has_missing_unc_any = True
-                display_text += "*"
-
-            if not has_ref_val:
-                # RM missing any ref value
-                item.setFlags(flags & ~Qt.ItemIsEnabled)
-                item.setCheckState(Qt.Unchecked)
-                item.setToolTip(
-                    f"{name} has no reference value for {ref_lookup} and cannot be used."
-                )
-
-                # Set icon to light grey and add question mark
-                pix.fill(QtGui.QColor(220, 220, 220))
-                painter = QtGui.QPainter(pix)
-                painter.setPen(QtGui.QColor(100, 100, 100))
-                painter.drawRect(0, 0, 11, 11)
-                painter.setPen(QtGui.QColor(Qt.red))
-                f = painter.font()
-                f.setPixelSize(10)
-                f.setBold(True)
-                painter.setFont(f)
-                painter.drawText(0, 0, 12, 12, Qt.AlignCenter, "?")
-                painter.end()
-                item.setIcon(QtGui.QIcon(pix))
-
-                if is_checked:
-                    selected_for_ratio = [r for r in selected_for_ratio if r != name]
-                    dict_modified = True
-
-            elif is_missing_unc and not apply_fix_unc:
-                # missing uncertainty and user has fix disabled
-                # Disable and uncheck
-                item.setFlags(flags & ~Qt.ItemIsEnabled)
-                item.setCheckState(Qt.Unchecked)
-                item.setToolTip(
-                    f"{name} has missing uncertainty and 'Assume relative error' is disabled."
-                )
-
-                # set as empty (transparent) icon with light grey border
-                pix = QtGui.QPixmap(12, 12)
-                pix.fill(QtGui.QColor(200, 200, 200, 50))
-                # border
-                painter = QtGui.QPainter(pix)
-                pen = QtGui.QPen(QtGui.QColor(150, 150, 150))
-                pen.setWidth(1)
-                painter.setPen(pen)
-                painter.drawRect(0, 0, 11, 11)
-                painter.end()
-                item.setIcon(QtGui.QIcon(pix))
-
-                if is_checked:
-                    selected_for_ratio = [r for r in selected_for_ratio if r != name]
-                    dict_modified = True
-            else:
-                # Valid RM
-                item.setFlags(flags | Qt.ItemIsEnabled)
-                item.setCheckState(Qt.Checked if is_checked else Qt.Unchecked)
-                item.setIcon(QtGui.QIcon(pix))
-
-            item.setText(display_text)
-            RMsListWidget.addItem(item)
-
-        if dict_modified:
-            rm_dict[target_el] = selected_for_ratio
-            drs.setSetting("RMSelections", rm_dict)
-
-        # Update missing uncertainty controls
-        missingUncLabel.setVisible(has_missing_unc_any)
-
-        # If no RMs have missing uncertainty, disable the controls entirely
-        if has_missing_unc_any:
-            fixUncCheck.setEnabled(True)
-            uncSpinBox.setEnabled(fixUncCheck.isChecked())
-            fixUncCheck.setToolTip(
-                "If a reference value has <= 0 uncertainty, assume a relative % error."
-            )
-        else:
-            fixUncCheck.setEnabled(False)
-            uncSpinBox.setEnabled(False)
-            fixUncCheck.setToolTip(
-                "No RMs with missing uncertainty found for this element."
-            )
-
-        RMsListWidget.blockSignals(False)
-        refreshPlot()
-
-    def updateRatioCombo():
-        """Update the El/Ca selection combobox using the current settings"""
-        selected_els = drs.setting("Elements")
-        ca_channel = drs.setting("CaChannel")
-
-        # Re-populate Ratio combo, keeping selection if possible
-        old_sel = ratioPlotCombo.currentData
-        if callable(old_sel):
-            old_sel = old_sel()
-
-        ratioPlotCombo.blockSignals(True)
-        ratioPlotCombo.clear()
-        for el in selected_els:
-            # Display: Li7/Ca43, Data: Li7
-            ratioPlotCombo.addItem(f"{el}/{ca_channel}", el)
-
-        # Restore old selection
-        idx = ratioPlotCombo.findData(old_sel)
-        if idx >= 0:
-            ratioPlotCombo.setCurrentIndex(idx)
-        elif ratioPlotCombo.count > 0:
-            ratioPlotCombo.setCurrentIndex(0)
-
-        ratioPlotCombo.blockSignals(False)
-
-    def on_elements_changed(selected):
-        drs.setSetting("Elements", selected)
-        elButton.setText(f"Elements ({len(selected)} selected)")
-        updateRatioCombo()        
-        updateRMListForRatio()
-    
-    def on_Ca_channel_changed(new_Ca_channel):
-        drs.setSetting("CaChannel", new_Ca_channel)
-        selected_els = drs.setting("Elements")
-        calc_raw_ratios(new_Ca_channel, selected_els, data.timeSeries(drs.setting("IndexChannel")))
-        updateRatioCombo()
-        refreshPlot()        
-
-    def on_rm_checked_changed(item):
-        save_current_rm_selection()
-        refreshPlot()
-
-    # --- Connections ---
-    # Use itemChanged for check state changes
-    elMenu.selectionChanged.connect(on_elements_changed)
-    ratioPlotCombo.currentIndexChanged.connect(updateRMListForRatio)
-    ratioViewCombo.currentIndexChanged.connect(refreshPlot)
-    RMsListWidget.itemChanged.connect(on_rm_checked_changed)
-    caComboBox.currentTextChanged.connect(on_Ca_channel_changed)
-
-    # Init state
+def settingsWidget():
     try:
-        on_elements_changed(settings["Elements"])
-    except RuntimeError:
-        # Iolite may have saved elements that aren't valid. If so, use all elements.
-        drs.setSetting("Elements", allElementNames)
-
-    mainLayout.addSpacing(20)  # Vertical space
-
-    # --- Time-varying regression group ---
-    tsrGroup = QtGui.QGroupBox("Time-varying regression")
-    tsrLayout = QtGui.QVBoxLayout()
-    tsrGroup.setLayout(tsrLayout)
-
-    tsrLabel = QtGui.QLabel(
-        "Fit regressions to blocks of reference materials, then interpolate with splines "
-        "to account for instrumental drift over time."
-    )
-    tsrLabel.setWordWrap(True)
-    tsrLayout.addWidget(tsrLabel)
-
-    tsrControlsLayout = QtGui.QHBoxLayout()
-    tsrLayout.addLayout(tsrControlsLayout)
-
-    # Min RMs per block
-    tsrControlsLayout.addWidget(QtGui.QLabel("Min RMs per block:"))
-    minRMsSpinBox = QtGui.QSpinBox()
-    minRMsSpinBox.setRange(1, 10)
-    minRMsSpinBox.setValue(drs.setting("MinRMsPerBlock"))
-    minRMsSpinBox.valueChanged.connect(
-        lambda v: (drs.setSetting("MinRMsPerBlock", int(v)), refreshPlot())
-    )
-    tsrControlsLayout.addWidget(minRMsSpinBox)
-
-    tsrControlsLayout.addSpacing(20)
-
-    # Block detection sensitivity
-    tsrControlsLayout.addWidget(QtGui.QLabel("Block detection sensitivity:"))
-    blockDetectionSensitivitySpinBox = QtGui.QDoubleSpinBox()
-    blockDetectionSensitivitySpinBox.setRange(0.1, 10.0)
-    blockDetectionSensitivitySpinBox.setSingleStep(0.1)
-    blockDetectionSensitivitySpinBox.setDecimals(2)
-    blockDetectionSensitivitySpinBox.setValue(
-        drs.setting("BlockDetectionSensitivity")
-    )
-    blockDetectionSensitivitySpinBox.setToolTip(
-        "1.0 should be fine for most sessions. Increase it to require a longer gap between blocks, or decrease it to allow shorter gaps."
-    )
-    blockDetectionSensitivitySpinBox.valueChanged.connect(
-        lambda v: (
-            drs.setSetting("BlockDetectionSensitivity", float(v)),
-            refreshPlot(),
-        )
-    )
-    tsrControlsLayout.addWidget(blockDetectionSensitivitySpinBox)
-
-    tsrControlsLayout.addSpacing(20)
-
-    # Spline type
-    tsrControlsLayout.addWidget(QtGui.QLabel("Spline type:"))
-    splineCombo = QtGui.QComboBox()
-    spline_types = [
-        "MeanMean",
-        "MeanMedian",
-        "LinearFit",
-        "WeightedLinearFit",
-        "StepLinear",
-        "StepForward",
-        "StepBackward",
-        "StepAverage",
-        "Nearest",
-        "Akima",
-        "Spline_NoSmoothing",
-        "Spline_Smooth1",
-        "Spline_Smooth2",
-        "Spline_Smooth3",
-        "Spline_Smooth4",
-        "Spline_Smooth5",
-        "Spline_Smooth6",
-        "Spline_Smooth7",
-        "Spline_Smooth8",
-        "Spline_Smooth9",
-        "Spline_Smooth10",
-        "Spline_AutoSmooth",
-    ]
-    splineCombo.addItems(spline_types)
-    splineCombo.setCurrentText(drs.setting("SplineType"))
-    splineCombo.currentTextChanged.connect(lambda t: drs.setSetting("SplineType", t))
-    tsrControlsLayout.addWidget(splineCombo)
-
-    tsrControlsLayout.addStretch()
-
-    mainLayout.addWidget(tsrGroup)
-
-    mainLayout.addSpacing(30)  # Vertical space
-
-    # --- Secondary Normalisation Group ---
-    secNormGroup = QtGui.QGroupBox("Secondary normalisation")
-    secNormLayout = QtGui.QVBoxLayout()
-    secNormGroup.setLayout(secNormLayout)
-
-    secNormLabel = QtGui.QLabel(
-        "After the regression calibration, apply a second normalisation factor derived from a reference material.\n"
-        "Select the measured RM to use, and which reference values to correct to."
-    )
-    secNormLabel.setWordWrap(True)
-    secNormLayout.addWidget(secNormLabel)
-
-    snHLayout = QtGui.QHBoxLayout()
-    secNormLayout.addLayout(snHLayout)
-
-    secNormCheckBox = QtGui.QCheckBox("Enabled")
-    secNormCheckBox.setChecked(drs.setting("SecondaryNorm"))
-    snHLayout.addWidget(secNormCheckBox)
-
-    snHLayout.addSpacing(20)
-
-    snHLayout.addWidget(QtGui.QLabel("Measured RM:"))
-    secNormCombo = QtGui.QComboBox()
-    secNormCombo.addItems(rmNames)
-    secNormCombo.setCurrentText(drs.setting("SecondaryNormRM"))
-    snHLayout.addWidget(secNormCombo)
-
-    snHLayout.addSpacing(30)
-
-    snHLayout.addWidget(QtGui.QLabel("Reference values:"))
-    allRefMaterials = data.referenceMaterialNames()
-    secNormRefCombo = QtGui.QComboBox()
-    secNormRefCombo.addItems(allRefMaterials)
-    secNormRefCombo.setCurrentText(drs.setting("SecondaryNormRefMaterial"))
-    snHLayout.addWidget(secNormRefCombo)
-
-    snHLayout.addStretch()
-
-    # Logic for Secondary Norm
-    def update_sec_norm_ui():
-        enabled = secNormCheckBox.isChecked()
-        secNormCombo.setEnabled(enabled)
-        secNormRefCombo.setEnabled(enabled)
-        drs.setSetting("SecondaryNorm", enabled)
-        drs.setSetting("SecondaryNormRM", secNormCombo.currentText)
-        drs.setSetting("SecondaryNormRefMaterial", secNormRefCombo.currentText)
-
-    secNormCheckBox.toggled.connect(update_sec_norm_ui)
-    secNormCombo.currentTextChanged.connect(update_sec_norm_ui)
-    secNormRefCombo.currentTextChanged.connect(update_sec_norm_ui)
-
-    # Init UI state
-    secNormCombo.setEnabled(secNormCheckBox.isChecked())
-    secNormRefCombo.setEnabled(secNormCheckBox.isChecked())
-
-    mainLayout.addWidget(secNormGroup)
-
-    mainLayout.addSpacing(30)  # Vertical space
-
-    # --- Bottom Row: Index and Mask ---
-    bottomRowLayout = QtGui.QHBoxLayout()
-    mainLayout.addLayout(bottomRowLayout)
-
-    # --- Index Channel Group ---
-    indexGroup = QtGui.QGroupBox("Index")
-    indexLayout = QtGui.QHBoxLayout()
-    indexGroup.setLayout(indexLayout)
-
-    indexLayout.addWidget(QtGui.QLabel("Channel:"))
-
-    # --- Index channel combo box ---
-    indexComboBox = QtGui.QComboBox(widget)
-    indexComboBox.addItems(timeSeriesNames)
-    indexComboBox.setCurrentText(settings["IndexChannel"])
-    indexComboBox.currentTextChanged.connect(
-        lambda t: drs.setSetting("IndexChannel", t)
-    )
-    indexLayout.addWidget(indexComboBox)
-
-    bottomRowLayout.addWidget(indexGroup)
-
-    # --- Mask Section --
-    maskGroup = QtGui.QGroupBox("Mask")
-    maskGroup.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Preferred)
-    maskLayout = QtGui.QHBoxLayout()
-    maskGroup.setLayout(maskLayout)
-
-    maskCheckBox = QtGui.QCheckBox("Enabled")
-    maskCheckBox.setChecked(drs.setting("Mask"))
-    maskLayout.addWidget(maskCheckBox)
-
-    maskLayout.addStretch()
-    maskLayout.addWidget(QtGui.QLabel("Channel:"))
-    maskComboBox = QtGui.QComboBox()
-    maskComboBox.addItems(data.timeSeriesNames(data.Input))
-    maskComboBox.setCurrentText(drs.setting("MaskChannel"))
-    maskLayout.addWidget(maskComboBox)
-
-    maskLayout.addStretch()
-    maskLayout.addWidget(QtGui.QLabel("Cutoff:"))
-    maskLineEdit = QtGui.QLineEdit(str(drs.setting("MaskCutoff")))
-    maskLayout.addWidget(maskLineEdit)
-
-    maskLayout.addStretch()
-    maskLayout.addWidget(QtGui.QLabel("Trim:"))
-    maskTrimLineEdit = QtGui.QLineEdit(str(drs.setting("MaskTrim")))
-    maskLayout.addWidget(maskTrimLineEdit)
-
-    # Enable/Disable logic for Mask
-    def update_mask_ui(b):
-        drs.setSetting("Mask", bool(b))
-        maskComboBox.setEnabled(bool(b))
-        maskLineEdit.setEnabled(bool(b))
-        maskTrimLineEdit.setEnabled(bool(b))
-
-    maskCheckBox.toggled.connect(update_mask_ui)
-    maskComboBox.currentTextChanged.connect(lambda t: drs.setSetting("MaskChannel", t))
-    maskLineEdit.textChanged.connect(lambda t: drs.setSetting("MaskCutoff", float(t)))
-    maskTrimLineEdit.textChanged.connect(lambda t: drs.setSetting("MaskTrim", float(t)))
-
-    # Init Mask UI state
-    update_mask_ui(maskCheckBox.isChecked())
-
-    bottomRowLayout.addWidget(maskGroup, 1)
-
-    # --- Register settings widget with DRS ---
-    drs.setSettingsWidget(outerWidget)
+        widget = R3SettingsWidget()
+        drs.setSettingsWidget(widget)
+    except Exception as e:
+        IoLog.error(f"Error creating settings widget: {e}")
