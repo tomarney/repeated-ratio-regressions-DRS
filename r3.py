@@ -1,11 +1,11 @@
 # Metadata
-# / Type: DRS
-# / Name: Repeated Ratio Regressions (R3)
-# / Authors: Thomas Arney
-# / Description: Calibration by time-varying regressions of measured and reference molar ratios.
-# / References: Tang et al. (2025, JAAS) DOI: 10.1039/D5JA00333D
-# / Version: 0.6
-# / Contact: t.arney@soton.ac.uk
+#/ Type: DRS
+#/ Name: Repeated Ratio Regressions (R3)
+#/ Authors: Thomas Arney
+#/ Description: Calibration by time-varying regressions of measured and reference molar ratios.
+#/ References: Tang et al. (2025, JAAS) DOI: 10.1039/D5JA00333D
+#/ Version: 0.6
+#/ Contact: t.arney@soton.ac.uk
 
 
 # # Uncomment for autocomplete in your IDE (outside iolite)
@@ -555,7 +555,7 @@ def calibrate_ratios(
         istp_name = f"{el}{mass}"
 
         slope_spl, intercept_spl = fit_splines_for_one_ratio(
-            block_reg_results, el, norm_channel_name, indexChannel, spline_type
+            block_reg_results, istp_name, norm_channel_name, indexChannel, spline_type
         )
 
         if slope_spl is None or intercept_spl is None:
