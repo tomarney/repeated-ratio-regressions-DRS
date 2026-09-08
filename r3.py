@@ -1,11 +1,11 @@
 # Metadata
-#/ Type: DRS
-#/ Name: Repeated Ratio Regressions (R3)
-#/ Authors: Thomas Arney
-#/ Description: Calibration by time-varying regressions of measured and reference molar ratios.
-#/ References: Tang et al. (2025, JAAS) DOI: 10.1039/D5JA00333D
-#/ Version: 0.5
-#/ Contact: t.arney@soton.ac.uk
+# / Type: DRS
+# / Name: Repeated Ratio Regressions (R3)
+# / Authors: Thomas Arney
+# / Description: Calibration by time-varying regressions of measured and reference molar ratios.
+# / References: Tang et al. (2025, JAAS) DOI: 10.1039/D5JA00333D
+# / Version: 0.6
+# / Contact: t.arney@soton.ac.uk
 
 
 # # Uncomment for autocomplete in your IDE (outside iolite)
@@ -102,9 +102,6 @@ except:
     PLOT.bottom().label = "Measured ratio"
     PLOT.left().label = "Reference ratio"
 
-    ann = PLOT.annotate("", 0.015, 0.01, "ptAxisRectRatio", Qt.AlignLeft | Qt.AlignTop)
-    ann.visible = False
-
     def showSettings():
         d = PlotSettings(PLOT)
         d.exec_()
@@ -166,30 +163,33 @@ def _check_and_fix_uncertainty(value, unc):
     return unc
 
 
-def _extract_element_symbol(el_name):
-    """Get element symbol from isotope name (e.g. Sr from Sr88)."""
+def _parse_isotope_name(el_name):
+    """Get element symbol and mass from isotope name (e.g. (Sr, 88) from Sr88)."""
     match = re.match(r"([a-zA-Z]+)([0-9]+)", el_name)
-    return match.group(1) if match else None
+    return (match.group(1) if match else None, match.group(2) if match else None)
 
 
-def gather_ratio_stats(target_el, ca_channel, selection=None, rm_group=None):
+def gather_ratio_stats(target_isotope, norm_channel, selection=None, rm_group=None):
     """
     Gather measured and reference values and uncertainties for a given ratio.
 
     Args:
-        target_el: str, element with mass (e.g. "Sr88")
-        ca_channel: str, calcium channel name (e.g. "Ca43")
+        target_isotope: str, isotope name (e.g. "Sr88")
+        norm_channel: str, normalisation channel name (e.g. "Ca43")
         selection: Selection object (for individual block fits)
         rm_group: SelectionGroup object (for overview fit)
 
     Returns: tuple (meas_mean, ref_val, meas_unc, ref_unc) or None
     """
-    el_sym = _extract_element_symbol(target_el)
+    el_sym, _ = _parse_isotope_name(target_isotope)
     if not el_sym:
         return None
+    norm_sym, _ = _parse_isotope_name(norm_channel)
+    if not norm_sym:
+        return None
 
-    ratio_channel_name = f"{target_el}_{ca_channel}_Raw"
-    ref_lookup = f"{el_sym}/Ca"
+    ratio_channel_name = f"{target_isotope}_{norm_channel}_Raw"
+    ref_lookup = f"{el_sym}/{norm_sym}"
 
     if selection:
         # single selection in a block
@@ -215,7 +215,6 @@ def gather_ratio_stats(target_el, ca_channel, selection=None, rm_group=None):
 
         # Get measured data
         if ratio_channel_name not in data.timeSeriesNames(data.Intermediate):
-            IoLog.error(f"Ratio channel {ratio_channel_name} not found.")
             return None
 
         ts = data.timeSeries(ratio_channel_name)
@@ -235,31 +234,31 @@ def gather_ratio_stats(target_el, ca_channel, selection=None, rm_group=None):
         return (meas_mean, ref_val, meas_unc, ref_unc)
 
     except Exception as e:
-        IoLog.error(f"Could not get data for {target_el} in {rm_name}: {e}")
+        IoLog.error(f"Could not get data for {target_isotope} in {rm_name}: {e}")
         return None
 
 
-def filter_elements_to_available(selected_elements, allInputChannels):
+def filter_available_channels(selected_channels, allInputChannels):
     """
-    Filter selected elements to those available in input channels
-    Returns a the filtered list and a list of (name, mass) tuples.
+    Get channels which are both in the user-selected list and available in the input channels.
+    Returns the filtered list of channel names and the same list parsed into (name, mass) tuples.
     """
-    available_names = [ch.name for ch in allInputChannels]
-    filtered = [el for el in selected_elements if el in available_names]
+    available_channels = [ch.name for ch in allInputChannels]
+    filtered = [el for el in selected_channels if el in available_channels]
 
     if not filtered:
         return [], []
 
-    elements_tuples = []
+    analytes_tuples = []
     for el_name in filtered:
         # extract element symbol and mass from the isotope name
-        match = re.match(r"([a-zA-Z]+)([0-9]+)", el_name)
-        if match:
-            elements_tuples.append((match.group(1), match.group(2)))
+        parsed = _parse_isotope_name(el_name)
+        if parsed:
+            analytes_tuples.append(parsed)
         else:
             IoLog.warning(f"Could not parse element and mass from {el_name}. Skipping.")
 
-    return filtered, elements_tuples
+    return filtered, analytes_tuples
 
 
 def create_mask(isMaskDefined, maskChannel, cutoff, trim, indexChannel):
@@ -294,34 +293,30 @@ def subtract_baselines(indexChannel, maskOption, maskChannel, cutoff, trim):
     return True
 
 
-def calc_raw_ratios(ca_channel_name, selected_elements, indexChannel):
+def calc_raw_ratios(norm_channel_name, selected_channels, indexChannel):
     """
-    Calculate raw element/Ca ratios from baseline-subtracted CPS channels.
-    Checks if CPS channels exist and triggers baseline subtraction if not.
+    Calculate raw ratios from baseline-subtracted CPS channels.
 
     Returns true if successful and false otherwise
     """
 
-    ca_cps_name = f"{ca_channel_name}_CPS"
+    norm_cps_name = f"{norm_channel_name}_CPS"
 
     try:
-        ca_data = data.timeSeries(ca_cps_name).data()
+        norm_data = data.timeSeries(norm_cps_name).data()
     except Exception as e:
         IoLog.error(
-            f"No baseline-subtracted {ca_cps_name} found. DRS cannot proceed: {e}"
+            f"No baseline-subtracted {norm_cps_name} found. DRS cannot proceed: {e}"
         )
         return False
 
-    # calc El/Ca ratios from baseline-subtracted CPS channels
-
-    ca_mass_match = re.search(r"(\d+)", ca_channel_name)
-    ca_mass = (
-        ca_mass_match.group(1) if ca_mass_match else "43"
-    )  # default. Maybe better to raise exception?
+    # calc ratios from baseline-subtracted CPS channels
 
     for ch in data.timeSeriesList(data.Intermediate):
+        if not ch.name.endswith("_CPS"):
+            continue
         ch_name = ch.name.replace("_CPS", "")
-        if ch_name not in selected_elements:
+        if ch_name not in selected_channels:
             continue
 
         el = ch.property("Element")
@@ -329,10 +324,10 @@ def calc_raw_ratios(ca_channel_name, selected_elements, indexChannel):
 
         # suppress warnings about NaNs or dividing by zero
         with np.errstate(divide="ignore", invalid="ignore"):
-            ratio = ch.data() / ca_data
+            ratio = ch.data() / norm_data
             ratio[~np.isfinite(ratio)] = np.nan
 
-        ratio_name = f"{el}{mass}_Ca{ca_mass}_Raw"
+        ratio_name = f"{el}{mass}_{norm_channel_name}_Raw"
         data.createTimeSeries(ratio_name, data.Intermediate, indexChannel.time(), ratio)
 
     return True
@@ -353,7 +348,11 @@ def drs_complete(error=False, error_message="Finished!"):
 
 
 def get_block_regression_data(
-    block: RMBlock, el_name, ca_channel_name, selected_rms=None, min_rms_per_block=2
+    block: RMBlock,
+    target_isotope,
+    norm_channel_name,
+    selected_rms=None,
+    min_rms_per_block=2,
 ):
     """
     Gathers RM stats then calculates ODR fit for a single RM block.
@@ -367,7 +366,7 @@ def get_block_regression_data(
             continue
 
         for sel in sel_list:
-            stats = gather_ratio_stats(el_name, ca_channel_name, selection=sel)
+            stats = gather_ratio_stats(target_isotope, norm_channel_name, selection=sel)
             if stats:
                 rm_data.append(stats)
                 valid_rm_names.append(rm_group_name)
@@ -401,7 +400,7 @@ def get_block_regression_data(
 
 
 def fit_regressions_for_all_blocks(
-    blocks, elements, ca_channel_name, min_rms_per_block=2, rm_selections=None
+    blocks, analytes, norm_channel_name, min_rms_per_block=2, rm_selections=None
 ):
     """
     Fit regressions for all blocks and elements.
@@ -410,17 +409,17 @@ def fit_regressions_for_all_blocks(
 
     Args:
         blocks: list of RMBlock objects
-        elements: list of (element, mass) tuples
-        ca_channel_name: str
+        analytes: list of (element, mass) tuples
+        norm_channel_name: str
         min_rms_per_block: int. Minimum standards per block
         rm_selections: dict. Standards to use in the fits, per element
 
-    Returns: dict {element: {times, slopes, intercepts, slopes_unc, intercepts_unc, r_squared}}
+    Returns: dict {isotope: {times, slopes, intercepts, slopes_unc, intercepts_unc, r_squared}}
     """
     results_dict = {}
 
-    for el, mass in elements:
-        el_name = f"{el}{mass}"
+    for el, mass in analytes:
+        istp_name = f"{el}{mass}"
         times = []
         slopes = []
         intercepts = []
@@ -428,7 +427,7 @@ def fit_regressions_for_all_blocks(
         intercepts_unc = []
         r_squared = []
 
-        selected_rms = rm_selections.get(el_name, []) if rm_selections else None
+        selected_rms = rm_selections.get(istp_name, []) if rm_selections else None
 
         for block_num, block in enumerate(blocks):
             # Count unique RM types in this block (after filtering by selected_rms if needed)
@@ -439,20 +438,22 @@ def fit_regressions_for_all_blocks(
 
             if viable_rms < min_rms_per_block:
                 IoLog.warning(
-                    f"Block has {viable_rms} valid RM types for {el_name}. "
+                    f"Block has {viable_rms} valid RM types for {istp_name}. "
                     f"Need at least {min_rms_per_block}. Skipping."
                 )
                 continue
 
             result = get_block_regression_data(
                 block,
-                el_name,
-                ca_channel_name,
+                istp_name,
+                norm_channel_name,
                 selected_rms,
                 min_rms_per_block=min_rms_per_block,
             )
             if result is None:
-                IoLog.warning(f"Could not fit {el_name}/Ca for block {block_num}")
+                IoLog.warning(
+                    f"Could not fit {istp_name}/{norm_channel_name} for block {block_num}"
+                )
                 continue
 
             fit_result = result["fit"]
@@ -464,7 +465,7 @@ def fit_regressions_for_all_blocks(
             r_squared.append(fit_result["r_squared"])
 
         if slopes:
-            results_dict[el] = {
+            results_dict[istp_name] = {
                 "times": np.array(times),
                 "slopes": np.array(slopes),
                 "intercepts": np.array(intercepts),
@@ -476,26 +477,30 @@ def fit_regressions_for_all_blocks(
     return results_dict
 
 
-def fit_splines_for_element(
-    block_reg_results, element, ca_channel_name, indexChannel, spline_type="StepLinear"
+def fit_splines_for_one_ratio(
+    block_reg_results,
+    isotope_name,
+    norm_channel_name,
+    indexChannel,
+    spline_type="StepLinear",
 ):
     """
-    Fit the given spline to block regression results for a single element/Ca ratio.
+    Fit the given spline to block regression results for a single normalised ratio.
     Creates intermediate channels for time-varying slope and intercept.
 
     Args:
         block_reg_results: dict from fit_regressions_for_all_blocks for one element
-        element: str (element symbol e.g. "Sr")
-        ca_channel_name: str (e.g. "Ca43")
+        isotope_name: str (e.g. "Sr88")
+        norm_channel_name: str (e.g. "Sr88")
         indexChannel: ChannelData object for full time array
         spline_type: str, type of spline
 
     Returns: tuple (slope_ts, intercept_ts) or (None, None)
     """
-    if element not in block_reg_results:
+    if isotope_name not in block_reg_results:
         return None, None
 
-    reg_data = block_reg_results[element]
+    reg_data = block_reg_results[isotope_name]
     times = reg_data["times"]
     slopes = reg_data["slopes"]
     intercepts = reg_data["intercepts"]
@@ -504,15 +509,12 @@ def fit_splines_for_element(
 
     if len(times) < 2:
         IoLog.warning(
-            f"Not enough valid blocks for {element}/Ca spline. Need at least 2."
+            f"Not enough valid blocks for {isotope_name}/{norm_channel_name} spline. Need at least 2."
         )
         return None, None
 
     slopes_unc = np.where(slopes_unc <= 0, np.abs(slopes) * 0.05, slopes_unc)
     intercepts_unc = np.where(intercepts_unc <= 0, 1e-6, intercepts_unc)
-
-    ca_mass_match = re.search(r"(\d+)", ca_channel_name)
-    ca_mass = ca_mass_match.group(1) if ca_mass_match else "43"
 
     try:
         slope_spl = data.spline(
@@ -522,11 +524,13 @@ def fit_splines_for_element(
             times, intercepts, intercepts_unc, spline_type, indexChannel.time()
         )
     except Exception as e:
-        IoLog.error(f"Failed to create splines for {element}/Ca: {e}")
+        IoLog.error(
+            f"Failed to create splines for {isotope_name}/{norm_channel_name}: {e}"
+        )
         return None, None
 
-    slope_channel_name = f"{element}_Ca{ca_mass}_slope"
-    intercept_channel_name = f"{element}_Ca{ca_mass}_intercept"
+    slope_channel_name = f"{isotope_name}_{norm_channel_name}_slope"
+    intercept_channel_name = f"{isotope_name}_{norm_channel_name}_intercept"
 
     data.createTimeSeries(
         slope_channel_name, data.Intermediate, indexChannel.time(), slope_spl
@@ -539,39 +543,60 @@ def fit_splines_for_element(
 
 
 def calibrate_ratios(
-    block_reg_results, elements, ca_channel_name, indexChannel, spline_type="StepLinear"
+    block_reg_results,
+    analytes,
+    norm_channel_name,
+    indexChannel,
+    spline_type="StepLinear",
 ):
     """Calibrate raw ratios using time-varying (splined) slope/intercept values."""
 
-    for el, mass in elements:
-        el_name = f"{el}{mass}"
+    for el, mass in analytes:
+        istp_name = f"{el}{mass}"
 
-        slope_spl, intercept_spl = fit_splines_for_element(
-            block_reg_results, el, ca_channel_name, indexChannel, spline_type
+        slope_spl, intercept_spl = fit_splines_for_one_ratio(
+            block_reg_results, el, norm_channel_name, indexChannel, spline_type
         )
 
         if slope_spl is None or intercept_spl is None:
-            IoLog.warning(f"Could not create splines for {el}/Ca. Skipping.")
+            IoLog.warning(
+                f"Could not create splines for {istp_name}/{norm_channel_name}. Skipping."
+            )
             continue
 
         try:
-            raw_ts = data.timeSeries(f"{el_name}_{ca_channel_name}_Raw")
+            raw_ts = data.timeSeries(f"{istp_name}_{norm_channel_name}_Raw")
         except Exception as e:
             IoLog.error(
-                f"Raw ratio channel {el_name}_{ca_channel_name}_Raw not found: {e}"
+                f"Raw ratio channel {istp_name}_{norm_channel_name}_Raw not found: {e}"
             )
             continue
 
         raw_data = raw_ts.data()
         corrected_data = slope_spl * raw_data + intercept_spl
 
+        top_name = el
+        bottom_name = _parse_isotope_name(norm_channel_name)[0] or norm_channel_name
+
+        if drs.setting("UseIsotopeLabels"):
+            top_name = istp_name
+            bottom_name = norm_channel_name
+
         data.createTimeSeries(
-            f"{el}/Ca", data.Output, indexChannel.time(), corrected_data
+            f"{top_name}/{bottom_name}",
+            data.Output,
+            indexChannel.time(),
+            corrected_data,
         )
 
 
 def apply_secondary_normalisation(
-    sec_norm_enabled, sec_norm_rm, sec_norm_ref_material, elements, indexChannel
+    sec_norm_enabled,
+    sec_norm_rm,
+    sec_norm_ref_material,
+    analytes,
+    primary_norm_channel,
+    indexChannel,
 ):
     """
     Apply secondary normalisation using reference material database.
@@ -581,7 +606,7 @@ def apply_secondary_normalisation(
         sec_norm_enabled: bool
         sec_norm_rm: str. Name of measured RM group
         sec_norm_ref_material: str. Name of RM in database for reference values
-        elements: list of (el, mass) tuples to normalise
+        analytes: list of (el, mass) tuples to normalise
         indexChannel: ChannelData object for output time series
     """
     if not sec_norm_enabled or not sec_norm_rm or not sec_norm_ref_material:
@@ -594,38 +619,46 @@ def apply_secondary_normalisation(
         IoLog.error(f"Failed to load secondary normalisation data: {e}")
         return
 
-    for el, _ in elements:
-        ratio_name = f"{el}/Ca"
+    for el_name, el_mass in analytes:
+        primary_norm_name = (
+            _parse_isotope_name(primary_norm_channel)[0] or primary_norm_channel
+        )
+        ratio_name_ref = f"{el_name}/{primary_norm_name}"
+        ratio_name_meas = f"{el_name}/{primary_norm_name}"
+        if drs.setting("UseIsotopeLabels"):
+            ratio_name_meas = f"{el_name}{el_mass}/{primary_norm_channel}"
         try:
-            ts = data.timeSeries(ratio_name)
+            ts = data.timeSeries(ratio_name_meas)
             meas_stats = sg.stats(ts)
             meas_val = meas_stats["mean"]
 
-            if ratio_name not in ref_data:
+            if ratio_name_ref not in ref_data:
                 IoLog.warning(
-                    f"No reference for {ratio_name} in {sec_norm_ref_material}. Skipping."
+                    f"No reference for {ratio_name_ref} in {sec_norm_ref_material}. Skipping."
                 )
                 continue
 
-            ref_val = ref_data[ratio_name].value()
+            ref_val = ref_data[ratio_name_ref].value()
             if meas_val == 0:
                 IoLog.warning(
-                    f"Measured {ratio_name} in {sec_norm_rm} is zero. Skipping."
+                    f"Measured {ratio_name_meas} in {sec_norm_rm} is zero. Skipping."
                 )
                 continue
 
             factor = ref_val / meas_val
             IoLog.information(
-                f"  {ratio_name}: Factor = {factor:.4f} ({ref_val:.6f} / {meas_val:.6f})"
+                f"  {ratio_name_meas}: Factor = {factor:.4f} ({ref_val:.6f} / {meas_val:.6f})"
             )
 
             corrected_data = ts.data() * factor
             data.createTimeSeries(
-                ratio_name, data.Output, indexChannel.time(), corrected_data
+                ratio_name_meas, data.Output, indexChannel.time(), corrected_data
             )
 
         except Exception as e:
-            IoLog.error(f"Error applying secondary normalisation for {ratio_name}: {e}")
+            IoLog.error(
+                f"Error applying secondary normalisation for {ratio_name_meas}: {e}"
+            )
 
 
 def find_rm_blocks():
@@ -709,7 +742,7 @@ def find_rm_blocks():
 def runDRS():
     """Main DRS entry point and coordinating function."""
 
-    drs.message("Starting Element/Calcium ratios DRS")
+    drs.message("Starting R3 DRS")
     drs.progress(0)
 
     #
@@ -722,8 +755,8 @@ def runDRS():
         maskChannel = data.timeSeries(settings["MaskChannel"])
         cutoff = settings["MaskCutoff"]
         trim = settings["MaskTrim"]
-        selected_elements = settings["Elements"]
-        ca_channel = settings["CaChannel"]
+        selected_channels = settings["AnalyteChannels"]
+        norm_channel = settings["NormChannel"]
 
         sec_norm_enabled = settings.get("SecondaryNorm", False)
         sec_norm_rm = settings.get("SecondaryNormRM", "")
@@ -733,10 +766,10 @@ def runDRS():
         drs_complete(error=True, error_message="Settings error. See messages.")
         return
 
-    selected_elements, elements = filter_elements_to_available(
-        selected_elements, data.timeSeriesList(data.Input)
+    selected_channels, analytes = filter_available_channels(
+        selected_channels, data.timeSeriesList(data.Input)
     )
-    if not selected_elements:
+    if not selected_channels:
         drs_complete(error=True, error_message="No valid elements selected.")
         return
 
@@ -754,7 +787,7 @@ def runDRS():
     # Step 3: Calculate raw ratios
     # ===========================
     drs.message("Calculating raw ratios")
-    raw_ratios_ok = calc_raw_ratios(ca_channel, selected_elements, indexChannel)
+    raw_ratios_ok = calc_raw_ratios(norm_channel, selected_channels, indexChannel)
     if not raw_ratios_ok:
         return
     drs.progress(15)
@@ -781,14 +814,15 @@ def runDRS():
 
     regr_results = fit_regressions_for_all_blocks(
         blocks,
-        elements,
-        ca_channel,
+        analytes,
+        norm_channel,
         min_rms_per_block=drs.setting("MinRMsPerBlock"),
         rm_selections=drs.setting("RMSelections"),
     )
     if not regr_results:
         drs_complete(
-            error=True, error_message="No successful regressions. Check RM data."
+            error=True,
+            error_message="No successful regressions. Check reference material data.",
         )
         return
 
@@ -800,7 +834,7 @@ def runDRS():
     drs.message("Calibrating raw ratios")
     spline_type = drs.setting("SplineType")
     calibrate_ratios(
-        regr_results, elements, ca_channel, indexChannel, spline_type=spline_type
+        regr_results, analytes, norm_channel, indexChannel, spline_type=spline_type
     )
     drs.progress(80)
 
@@ -812,23 +846,14 @@ def runDRS():
             f"Applying secondary normalisation: {sec_norm_rm} → {sec_norm_ref_material}"
         )
         apply_secondary_normalisation(
-            sec_norm_enabled, sec_norm_rm, sec_norm_ref_material, elements, indexChannel
+            sec_norm_enabled,
+            sec_norm_rm,
+            sec_norm_ref_material,
+            analytes,
+            norm_channel,
+            indexChannel,
         )
-
-    #
-    # Step 8: Calculate derived channels (e.g. Li/Mg)
-    # ===========================
-    drs.message("Calculating derived channels")
-    try:
-        li_ca = data.timeSeries("Li/Ca").data()
-        mg_ca = data.timeSeries("Mg/Ca").data()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            li_mg = li_ca / mg_ca
-            li_mg[~np.isfinite(li_mg)] = np.nan
-        data.createTimeSeries("Li/Mg", data.Output, indexChannel.time(), li_mg)
-    except (KeyError, Exception):
-        IoLog.information("Li/Mg calculation skipped (missing Li/Ca or Mg/Ca).")
-
+    drs.progress(90)
     drs_complete()
 
 
@@ -842,21 +867,57 @@ def runDRS():
 class InputChannelsMenu(QtGui.QMenu):
     selectionChanged = QtCore.Signal(list)
 
-    def __init__(self, parent, all_channels, current_selection):
+    def __init__(self, parent, all_channels, current_selection, disabled_channel=None):
         super().__init__(parent)
         self.all_channels = all_channels
         self.current_selection = list(current_selection)
+        self.disabled_channel = disabled_channel
+        self.actions_map = {}
 
         for ch in self.all_channels:
             a = QtGui.QWidgetAction(self)
             cb = QtGui.QCheckBox(ch, self)
             cb.setStyleSheet("QCheckBox { padding-left: 5px; margin: 3px; }")
+
             if ch in self.current_selection:
                 cb.setChecked(True)
 
             a.setDefaultWidget(cb)
             self.addAction(a)
+            self.actions_map[ch] = (a, cb)
+
             cb.clicked.connect(partial(self.updateSelection, ch))
+
+        if self.disabled_channel:
+            self.setChannelDisabled(self.disabled_channel, True)
+
+    def setChannelDisabled(self, channel, disabled):
+        if channel in self.actions_map:
+            action, cb = self.actions_map[channel]
+            if disabled:
+                cb.setChecked(False)
+                cb.setEnabled(False)
+                action.setEnabled(False)
+                if channel in self.current_selection:
+                    self.current_selection.remove(channel)
+            else:
+                cb.setEnabled(True)
+                action.setEnabled(True)
+
+    def setChannelChecked(self, channel, checked):
+        if channel in self.actions_map:
+            _, cb = self.actions_map[channel]
+            cb.setChecked(checked)
+            if checked:
+                if channel not in self.current_selection:
+                    self.current_selection.append(channel)
+            else:
+                if channel in self.current_selection:
+                    self.current_selection.remove(channel)
+
+            self.current_selection = [
+                ch for ch in self.all_channels if ch in self.current_selection
+            ]
 
     def updateSelection(self, channel, checked):
         if checked:
@@ -866,7 +927,6 @@ class InputChannelsMenu(QtGui.QMenu):
             if channel in self.current_selection:
                 self.current_selection.remove(channel)
 
-        # Maintain order based on all_channels
         self.current_selection = [
             ch for ch in self.all_channels if ch in self.current_selection
         ]
@@ -884,23 +944,16 @@ class R3SettingsWidget(QtGui.QWidget):
 
         self.rmNames = data.selectionGroupNames(data.ReferenceMaterial)
         self.timeSeriesNames = data.timeSeriesNames(data.Input)
-
-        self.allElementNames = [
-            ch.name
-            for ch in data.timeSeriesList(data.Input)
-            if not (ch.name.startswith("Ca") or ch.name.startswith("TotalBeam"))
+        self.allIsotopeChannels = [
+            ch for ch in self.timeSeriesNames if ch not in ["TotalBeam"]
         ]
 
-        self.caChannels = [c for c in self.timeSeriesNames if c.startswith("Ca4")]
         self.defaultChannelName = (
             self.timeSeriesNames[0] if self.timeSeriesNames else ""
         )
-        self.defaultCa = (
-            self.caChannels[0] if self.caChannels else self.defaultChannelName
-        )
 
         self.init_default_settings()
-        self.run_initial_setup()
+        self.run_initial_setup()  # must run before setup_ui() so that all calculated channels are available for the plot
         self.setup_ui()
         self.connect_signals()
         QtGui.QApplication.processEvents()
@@ -908,28 +961,58 @@ class R3SettingsWidget(QtGui.QWidget):
     def init_default_settings(self):
         drs.setSetting("IndexChannel", self.defaultChannelName)
         drs.setSetting("Mask", False)
-        drs.setSetting("MaskChannel", self.defaultCa)
+        drs.setSetting("MaskChannel", self.defaultChannelName)
         drs.setSetting("MaskCutoff", 500000.0)
         drs.setSetting("MaskTrim", 0.0)
-        drs.setSetting("CaChannel", self.defaultCa)
+
+        # set preferences for default normalising channel in this list
+        # Only relevant for very first use: otherwise iolite remembers the last used channel.
+        # use either the element symbol (matches the first isotope of that element) or the full isotope name (e.g. "Ca44")
+        # The first match in the list is used.
+        norm_preferences = ["Ca43", "Ca44", "Ca"]
+        default_norm = self.defaultChannelName
+
+        # Match against preference hierarchy
+        for pref in norm_preferences:
+            found = False
+            for ch in self.allIsotopeChannels:
+                elem, _ = _parse_isotope_name(ch)
+                # Exact isotope match (e.g. "Ca44") or exact element symbol match (e.g. "Ca" or "C")
+                if ch == pref or elem == pref:
+                    default_norm = ch
+                    found = True
+                    break
+            if found:
+                break
+
+        drs.setSetting("NormChannel", default_norm)
+        drs.setSetting("UseIsotopeLabels", False)
         drs.setSetting("FixMissingUnc", True)
         drs.setSetting("MissingUnc2RSD", 10.0)
         drs.setSetting("MinRMsPerBlock", 2)
         drs.setSetting("BlockDetectionSensitivity", 1.0)
         drs.setSetting("SplineType", "StepLinear")
 
-        saved_elements = drs.setting("Elements")
-        elements_to_use = (
-            [el for el in saved_elements if el in self.allElementNames]
-            if saved_elements
-            else self.allElementNames
+        # Exclude initial norm channel from default analyte channels
+        default_analytes = [ch for ch in self.allIsotopeChannels if ch != default_norm]
+
+        saved_analytes = drs.setting("AnalyteChannels")
+        analytes_to_use = (
+            [
+                ch
+                for ch in saved_analytes
+                if ch in self.allIsotopeChannels and ch != default_norm
+            ]
+            if saved_analytes
+            else default_analytes
         )
-        drs.setSetting("Elements", elements_to_use)
+        drs.setSetting("AnalyteChannels", analytes_to_use)
 
         current_rm_sel = drs.setting("RMSelections")
         if not current_rm_sel:
             drs.setSetting(
-                "RMSelections", {el: self.rmNames for el in self.allElementNames}
+                "RMSelections",
+                {el: list(self.rmNames) for el in self.allIsotopeChannels},
             )
         else:
             filtered_rm_dict = {
@@ -941,16 +1024,16 @@ class R3SettingsWidget(QtGui.QWidget):
     def run_initial_setup(self):
         try:
             settings = drs.settings()
-            ca_channel = settings["CaChannel"]
+            norm_channel = settings["NormChannel"]
             idx_name = settings["IndexChannel"]
             if idx_name:
                 idx_ch = data.timeSeries(idx_name)
                 drs.setIndexChannel(idx_ch)
-                selected_elements, _ = filter_elements_to_available(
-                    settings["Elements"], data.timeSeriesList(data.Input)
+                selected_channels, _ = filter_available_channels(
+                    settings["AnalyteChannels"], data.timeSeriesList(data.Input)
                 )
-                for el in selected_elements:
-                    if f"{el}_CPS" not in data.timeSeriesNames(data.Intermediate):
+                for istp in selected_channels:
+                    if f"{istp}_CPS" not in data.timeSeriesNames(data.Intermediate):
                         # At least one selected element is missing CPS channel
                         # (re)run baseline subtraction
                         subtract_baselines(
@@ -962,12 +1045,12 @@ class R3SettingsWidget(QtGui.QWidget):
                         )
                         break
 
-                for el in selected_elements:
-                    if f"{el}_{ca_channel}_Raw" not in data.timeSeriesNames(
+                for istp in selected_channels:
+                    if f"{istp}_{norm_channel}_Raw" not in data.timeSeriesNames(
                         data.Intermediate
                     ):
                         # At least one selected element is missing raw ratio channel
-                        calc_raw_ratios(ca_channel, selected_elements, idx_ch)
+                        calc_raw_ratios(norm_channel, selected_channels, idx_ch)
                         break
         except Exception as e:
             IoLog.warning(f"Failed to run initial setup for DRS: {e}")
@@ -992,7 +1075,7 @@ class R3SettingsWidget(QtGui.QWidget):
             get_color(rm)
 
         note = QtGui.QLabel(
-            "Note: This DRS calculates E/Ca ratios in the units stored in the reference material database. "
+            "Note: This DRS calculates calibrated ratios in the units stored in the reference material database. "
             "Make sure all values are in the appropriate units and consistent between RMs before running the DRS. "
             "Iolite interprets uncertainties in the reference material values as 2 standard deviations."
         )
@@ -1000,8 +1083,8 @@ class R3SettingsWidget(QtGui.QWidget):
         self.mainLayout.addWidget(note)
         self.mainLayout.addSpacing(20)
 
-        # --- E/Ca ratios ---
-        self.setup_eca_group()
+        # --- ratio selection ---
+        self.setup_ratio_group()
 
         # --- Preview ---
         self.setup_preview_group()
@@ -1015,34 +1098,51 @@ class R3SettingsWidget(QtGui.QWidget):
         # --- Bottom row (Index/Mask) ---
         self.setup_bottom_row()
 
-    def setup_eca_group(self):
-        ecGroup = QtGui.QGroupBox("E/Ca ratios")
-        ecGroupLayout = QtGui.QHBoxLayout(ecGroup)
+    def setup_ratio_group(self):
+        ratGroup = QtGui.QGroupBox("Ratio selection")
+        ratGroupLayout = QtGui.QHBoxLayout(ratGroup)
 
-        ecGroupLayout.addWidget(QtGui.QLabel("Calculate these ratios:"))
-        ecGroupLayout.addSpacing(10)
+        ratGroupLayout.addWidget(QtGui.QLabel("Calculate these ratios:"))
+        ratGroupLayout.addSpacing(10)
 
-        self.elButton = QtGui.QToolButton(self.contentWidget)
-        self.elButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.elButton.setIcon(CUI().icon("checklist"))
-        self.elButton.setPopupMode(QtGui.QToolButton.InstantPopup)
-        self.elMenu = InputChannelsMenu(
-            self.elButton, self.allElementNames, drs.setting("Elements")
+        norm_channel = drs.setting("NormChannel")
+
+        self.analytesSelector = QtGui.QToolButton(self.contentWidget)
+        self.analytesSelector.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.analytesSelector.setIcon(CUI().icon("checklist"))
+        self.analytesSelector.setPopupMode(QtGui.QToolButton.InstantPopup)
+        self.analytesMenu = InputChannelsMenu(
+            self.analytesSelector,
+            self.allIsotopeChannels,
+            drs.setting("AnalyteChannels"),
+            disabled_channel=norm_channel,
         )
-        self.elButton.setMenu(self.elMenu)
-        ecGroupLayout.addWidget(self.elButton)
+        self.analytesSelector.setMenu(self.analytesMenu)
+        ratGroupLayout.addWidget(self.analytesSelector)
 
         solidusLabel = QtGui.QLabel("/")
         solidusLabel.setStyleSheet("font-size: 20px; font-weight: bold;")
-        ecGroupLayout.addWidget(solidusLabel)
+        ratGroupLayout.addWidget(solidusLabel)
 
-        self.caComboBox = QtGui.QComboBox(self.contentWidget)
-        self.caComboBox.addItems(self.caChannels)
-        self.caComboBox.setCurrentText(drs.setting("CaChannel"))
-        ecGroupLayout.addWidget(self.caComboBox)
-        ecGroupLayout.addStretch()
+        self.normalisingChannelSelector = QtGui.QComboBox(self.contentWidget)
+        self.normalisingChannelSelector.addItems(self.allIsotopeChannels)
+        self.normalisingChannelSelector.setCurrentText(norm_channel)
+        ratGroupLayout.addWidget(self.normalisingChannelSelector)
+        ratGroupLayout.addSpacing(10)
 
-        self.mainLayout.addWidget(ecGroup)
+        self.useIsotopeLabelsCheckBox = QtGui.QCheckBox(
+            "Show isotopic ratios", self.contentWidget
+        )
+        self.useIsotopeLabelsCheckBox.setToolTip(
+            "Explicitly show the underlying isotopic ratios rather than presenting as elemental ratios. "
+            + "Only affects the labels: values are unchanged."
+        )
+        self.useIsotopeLabelsCheckBox.setChecked(drs.setting("UseIsotopeLabels"))
+        ratGroupLayout.addWidget(self.useIsotopeLabelsCheckBox)
+
+        ratGroupLayout.addStretch()
+
+        self.mainLayout.addWidget(ratGroup)
         self.mainLayout.addSpacing(20)
 
     def setup_preview_group(self):
@@ -1052,23 +1152,23 @@ class R3SettingsWidget(QtGui.QWidget):
         # Left side RM layout
         rmLayout = QtGui.QVBoxLayout()
 
-        ratioRow = QtGui.QHBoxLayout()
-        self.ratioPlotCombo = QtGui.QComboBox(self.contentWidget)
-        self.ratioViewCombo = QtGui.QComboBox(self.contentWidget)
-        self.ratioViewCombo.addItems(["Overview", "Block: 1"])
+        previewControlsRow = QtGui.QHBoxLayout()
+        self.previewRatioSelector = QtGui.QComboBox(self.contentWidget)
+        self.previewBlockSelector = QtGui.QComboBox(self.contentWidget)
+        self.previewBlockSelector.addItems(["Overview", "Block: 1"])
 
-        ratioRow.addWidget(self.ratioPlotCombo, 1)
-        ratioRow.addWidget(self.ratioViewCombo)
+        previewControlsRow.addWidget(self.previewRatioSelector, 1)
+        previewControlsRow.addWidget(self.previewBlockSelector)
 
         rmLayout.addWidget(QtGui.QLabel("Preview:"))
-        rmLayout.addLayout(ratioRow)
+        rmLayout.addLayout(previewControlsRow)
         rmLayout.addSpacing(10)
         rmLayout.addWidget(QtGui.QLabel("Reference materials:"))
 
-        self.RMsListWidget = QtGui.QListWidget(self.contentWidget)
-        self.RMsListWidget.setSelectionMode(QtGui.QAbstractItemView.NoSelection)
-        self.RMsListWidget.setMinimumHeight(200)
-        rmLayout.addWidget(self.RMsListWidget)
+        self.previewRMsList = QtGui.QListWidget(self.contentWidget)
+        self.previewRMsList.setSelectionMode(QtGui.QAbstractItemView.NoSelection)
+        self.previewRMsList.setMinimumHeight(200)
+        rmLayout.addWidget(self.previewRMsList)
 
         self.missingUncLabel = QtGui.QLabel("* missing uncertainty in ref. value")
         self.missingUncLabel.setStyleSheet("font-style: italic; font-size: 9pt;")
@@ -1154,7 +1254,7 @@ class R3SettingsWidget(QtGui.QWidget):
 
         # Spline type
         tsrControlsLayout.addWidget(QtGui.QLabel("Spline type:"))
-        self.splineCombo = QtGui.QComboBox()
+        self.splineTypeSelector = QtGui.QComboBox()
         # no clever way I can see to get this list so just hardcode as 3DTE does
         spline_types = [
             "MeanMean",
@@ -1180,9 +1280,9 @@ class R3SettingsWidget(QtGui.QWidget):
             "Spline_Smooth10",
             "Spline_AutoSmooth",
         ]
-        self.splineCombo.addItems(spline_types)
-        self.splineCombo.setCurrentText(drs.setting("SplineType"))
-        tsrControlsLayout.addWidget(self.splineCombo)
+        self.splineTypeSelector.addItems(spline_types)
+        self.splineTypeSelector.setCurrentText(drs.setting("SplineType"))
+        tsrControlsLayout.addWidget(self.splineTypeSelector)
         tsrControlsLayout.addStretch()
 
         tsrLayout.addLayout(tsrControlsLayout)
@@ -1234,6 +1334,7 @@ class R3SettingsWidget(QtGui.QWidget):
         self.indexComboBox.setCurrentText(drs.setting("IndexChannel"))
         indexLayout.addWidget(self.indexComboBox)
         bottomRowLayout.addWidget(indexGroup)
+        bottomRowLayout.addSpacing(20)
 
         maskGroup = QtGui.QGroupBox("Mask (click Crunch Data to apply)")
         maskLayout = QtGui.QHBoxLayout(maskGroup)
@@ -1241,22 +1342,24 @@ class R3SettingsWidget(QtGui.QWidget):
         self.maskCheckBox.setChecked(drs.setting("Mask"))
         maskLayout.addWidget(self.maskCheckBox)
 
-        maskLayout.addStretch()
+        maskLayout.addSpacing(20)
         maskLayout.addWidget(QtGui.QLabel("Channel:"))
         self.maskChannelComboBox = QtGui.QComboBox()
         self.maskChannelComboBox.addItems(data.timeSeriesNames(data.Input))
         self.maskChannelComboBox.setCurrentText(drs.setting("MaskChannel"))
         maskLayout.addWidget(self.maskChannelComboBox)
 
-        maskLayout.addStretch()
+        maskLayout.addSpacing(10)
         maskLayout.addWidget(QtGui.QLabel("Cutoff:"))
         self.maskCutoffInput = QtGui.QLineEdit(str(drs.setting("MaskCutoff")))
         maskLayout.addWidget(self.maskCutoffInput)
 
-        maskLayout.addStretch()
+        maskLayout.addSpacing(10)
         maskLayout.addWidget(QtGui.QLabel("Trim:"))
         self.maskTrimInput = QtGui.QLineEdit(str(drs.setting("MaskTrim")))
         maskLayout.addWidget(self.maskTrimInput)
+        maskLayout.addStretch()
+
         bottomRowLayout.addWidget(maskGroup, 1)
 
         self.mainLayout.addLayout(bottomRowLayout)
@@ -1268,11 +1371,18 @@ class R3SettingsWidget(QtGui.QWidget):
 
     def connect_signals(self):
         """Connect the handlers for all the UI inputs"""
-        self.elMenu.selectionChanged.connect(self.on_elements_changed)
-        self.caComboBox.currentTextChanged.connect(self.on_Ca_channel_changed)
-        self.ratioPlotCombo.currentIndexChanged.connect(self.update_rm_list_for_ratio)
-        self.ratioViewCombo.currentIndexChanged.connect(self.refresh_plot)
-        self.RMsListWidget.itemChanged.connect(self.on_rm_checked_changed)
+        self.analytesMenu.selectionChanged.connect(self.on_analytes_changed)
+        self.normalisingChannelSelector.currentTextChanged.connect(
+            self.on_norm_channel_changed
+        )
+        self.useIsotopeLabelsCheckBox.toggled.connect(
+            self.on_use_isotope_labels_toggled
+        )
+        self.previewRatioSelector.currentIndexChanged.connect(
+            self.update_rm_list_for_preview
+        )
+        self.previewBlockSelector.currentIndexChanged.connect(self.refresh_plot)
+        self.previewRMsList.itemChanged.connect(self.on_rm_checked_changed)
         self.selAllBtn.clicked.connect(lambda: self.set_all_rms_checked(True))
         self.deSelAllBtn.clicked.connect(lambda: self.set_all_rms_checked(False))
         self.resetBtn.clicked.connect(self.reset_all_ratios)
@@ -1289,7 +1399,7 @@ class R3SettingsWidget(QtGui.QWidget):
                 self.refresh_plot(),
             )
         )
-        self.splineCombo.currentTextChanged.connect(
+        self.splineTypeSelector.currentTextChanged.connect(
             lambda t: drs.setSetting("SplineType", t)
         )
         self.secNormCheckBox.toggled.connect(self.update_sec_norm_ui)
@@ -1310,19 +1420,21 @@ class R3SettingsWidget(QtGui.QWidget):
         )
 
         # initial state sync
-        self.on_elements_changed(drs.setting("Elements") or self.allElementNames)
+        self.on_analytes_changed(
+            drs.setting("AnalyteChannels") or self.allIsotopeChannels
+        )
 
     # --- UI functions ---
     def set_all_rms_checked(self, state):
         """Select or deselect all RMs in the currently selected ratio"""
         try:
-            self.RMsListWidget.blockSignals(True)
-            n = self.RMsListWidget.count
+            self.previewRMsList.blockSignals(True)
+            n = self.previewRMsList.count
             for i in range(n):
-                self.RMsListWidget.item(i).setCheckState(
+                self.previewRMsList.item(i).setCheckState(
                     Qt.Checked if state else Qt.Unchecked
                 )
-            self.RMsListWidget.blockSignals(False)
+            self.previewRMsList.blockSignals(False)
             self.save_current_rm_selection()
             self.refresh_plot()
         except Exception as e:
@@ -1331,24 +1443,24 @@ class R3SettingsWidget(QtGui.QWidget):
     def reset_all_ratios(self):
         """Select all RMs in all ratios"""
         try:
-            all_els = drs.setting("Elements")
+            all_els = drs.setting("AnalyteChannels")
             new_dict = {el: self.rmNames for el in all_els}
             drs.setSetting("RMSelections", new_dict)
-            self.update_rm_list_for_ratio()
+            self.update_rm_list_for_preview()
         except Exception as e:
             IoLog.error(f"Error resetting: {e}")
 
     def save_current_rm_selection(self):
         """Save the current RM selections for the currently selected ratio"""
         try:
-            curr_el = self.ratioPlotCombo.currentData
+            curr_el = self.previewRatioSelector.currentData
             if not curr_el:
                 return
 
             selected = []
-            n = self.RMsListWidget.count
+            n = self.previewRMsList.count
             for i in range(n):
-                item = self.RMsListWidget.item(i)
+                item = self.previewRMsList.item(i)
                 if item.checkState() == Qt.Checked:
                     selected.append(item.data(Qt.UserRole))
 
@@ -1358,26 +1470,56 @@ class R3SettingsWidget(QtGui.QWidget):
         except Exception as e:
             IoLog.error(f"Error saving RM selection: {e}")
 
-    def on_elements_changed(self, selected):
-        """Handle the user changing which elements are selected in the dropdown"""
-        drs.setSetting("Elements", selected)
-        self.elButton.setText(f"Elements ({len(selected)} selected)")
-        self.update_ratio_combo()
-        self.update_rm_list_for_ratio()
+    def on_analytes_changed(self, selected):
+        """Handle the user changing which input channels are selected in the dropdown"""
+        drs.setSetting("AnalyteChannels", selected)
+        self.analytesSelector.setText(f"Elements ({len(selected)} selected)")
+        self.update_previewed_ratio_combo()
+        self.update_rm_list_for_preview()
 
-    def on_Ca_channel_changed(self, new_Ca_channel):
-        """Handle the user changing the Ca channel in the dropdown"""
-        drs.setSetting("CaChannel", new_Ca_channel)
-        calc_raw_ratios(
-            new_Ca_channel,
-            drs.setting("Elements"),
-            data.timeSeries(drs.setting("IndexChannel")),
-        )
-        self.update_ratio_combo()
+    def on_norm_channel_changed(self, new_norm_channel):
+        """
+        Handle the user changing the normalisation channel in the dropdown.
+        """
+        old_norm_channel = drs.setting("NormChannel")
+        drs.setSetting("NormChannel", new_norm_channel)
+
+        # Enable the old normChannel
+        if old_norm_channel and old_norm_channel in self.allIsotopeChannels:
+            self.analytesMenu.setChannelDisabled(old_norm_channel, False)
+            self.analytesMenu.setChannelChecked(old_norm_channel, True)
+
+        # Disable the new normChannel
+        self.analytesMenu.setChannelDisabled(new_norm_channel, True)
+
+        # Save the updated selections to the DRS settings
+        selected = self.analytesMenu.current_selection
+        drs.setSetting("AnalyteChannels", selected)
+
+        # Re-calculate raw ratios
+        idx_ch_name = drs.setting("IndexChannel")
+        if idx_ch_name:
+            calc_raw_ratios(
+                new_norm_channel,
+                selected,
+                data.timeSeries(idx_ch_name),
+            )
+
+        # Update UI
+        self.analytesSelector.setText(f"Elements ({len(selected)} selected)")
+        self.update_previewed_ratio_combo()
+        self.update_rm_list_for_preview()
+
+    def on_use_isotope_labels_toggled(self, checked):
+        drs.setSetting("UseIsotopeLabels", bool(checked))
+        self.update_previewed_ratio_combo()
         self.refresh_plot()
 
     def on_rm_checked_changed(self):
-        """Handle the user checking or unchecking an RM in the list"""
+        """
+        Handle the user checking or unchecking an RM in the list.
+        Saves the current selection and refreshes the plot.
+        """
         self.save_current_rm_selection()
         self.refresh_plot()
 
@@ -1398,47 +1540,60 @@ class R3SettingsWidget(QtGui.QWidget):
         self.maskTrimInput.setEnabled(bool(b))
 
     def update_unc_fix_state(self, b):
-        """Handle the 'assume error if missing' checkbox being toggled"""
+        """
+        Handle the 'assume error if missing' checkbox being toggled.
+        Updates the RM list.
+        """
         drs.setSetting("FixMissingUnc", bool(b))
         self.uncSpinBox.setEnabled(bool(b))
-        self.update_rm_list_for_ratio()
+        self.update_rm_list_for_preview()
 
-    def update_ratio_combo(self):
-        """Update the E/Ca ratio dropdown after the user changes the inputs"""
-        selected_els = drs.setting("Elements")
-        ca_channel = drs.setting("CaChannel")
-        old_sel = self.ratioPlotCombo.currentData
+    def update_previewed_ratio_combo(self):
+        """Update the plot preview ratio dropdown after the user changes the inputs"""
+        selected_chs = drs.setting("AnalyteChannels")
+        norm_channel = drs.setting("NormChannel")
+        use_isotope_labels = drs.setting("UseIsotopeLabels")
+        old_sel = self.previewRatioSelector.currentData
 
-        self.ratioPlotCombo.blockSignals(True)
-        self.ratioPlotCombo.clear()
-        for el in selected_els:
-            self.ratioPlotCombo.addItem(f"{el}/{ca_channel}", el)
+        self.previewRatioSelector.blockSignals(True)
+        self.previewRatioSelector.clear()
+        for ch in selected_chs:
+            if ch != norm_channel:
+                if use_isotope_labels:
+                    disp_text = f"{ch}/{norm_channel}"
+                else:
+                    analyte_elem, _ = _parse_isotope_name(ch)
+                    norm_elem, _ = _parse_isotope_name(norm_channel)
+                    disp_text = f"{analyte_elem}/{norm_elem}"
+                self.previewRatioSelector.addItem(disp_text, ch)
 
-        idx = self.ratioPlotCombo.findData(old_sel)
-        self.ratioPlotCombo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.ratioPlotCombo.blockSignals(False)
+        idx = self.previewRatioSelector.findData(old_sel)
+        self.previewRatioSelector.setCurrentIndex(idx if idx >= 0 else 0)
+        self.previewRatioSelector.blockSignals(False)
 
-    def update_rm_list_for_ratio(self):
-        """Update the list of RMs when the user changes the selected element"""
-        self.RMsListWidget.blockSignals(True)
-        self.RMsListWidget.clear()
+    def update_rm_list_for_preview(self):
+        """Update the list of RMs when the user changes the previewed ratio"""
+        self.previewRMsList.blockSignals(True)
+        self.previewRMsList.clear()
 
-        target_el = self.ratioPlotCombo.currentData
-        if not target_el:
-            self.RMsListWidget.blockSignals(False)
+        target_ch = self.previewRatioSelector.currentData
+        if not target_ch:
+            self.previewRMsList.blockSignals(False)
             return
 
         rm_dict = drs.setting("RMSelections") or {}
-        if target_el not in rm_dict:
-            rm_dict[target_el] = self.rmNames
+        if target_ch not in rm_dict:
+            rm_dict[target_ch] = self.rmNames
             drs.setSetting("RMSelections", rm_dict)
 
-        selected_for_ratio = rm_dict.get(target_el, [])
+        selected_for_ratio = rm_dict.get(target_ch, [])
         apply_fix_unc = drs.setting("FixMissingUnc")
 
         has_missing_unc_any = False
-        match = re.match(r"([a-zA-Z]+)([0-9]+)", target_el)
-        ref_lookup = f"{match.group(1)}/Ca" if match else None
+        el_name, _ = _parse_isotope_name(target_ch)
+        norm_channel = drs.setting("NormChannel")
+        norm_name, _ = _parse_isotope_name(norm_channel)
+        ref_lookup = f"{el_name}/{norm_name}" if (el_name and norm_name) else ""
 
         for name in self.rmNames:
             item = QtGui.QListWidgetItem()  # Text set later
@@ -1490,27 +1645,39 @@ class R3SettingsWidget(QtGui.QWidget):
                 item.setIcon(QtGui.QIcon(pix))
 
             item.setText(display_text)
-            self.RMsListWidget.addItem(item)
+            self.previewRMsList.addItem(item)
 
         self.missingUncLabel.setVisible(has_missing_unc_any)
         self.fixUncCheck.setEnabled(has_missing_unc_any)
         self.uncSpinBox.setEnabled(has_missing_unc_any and self.fixUncCheck.isChecked())
 
-        self.RMsListWidget.blockSignals(False)
+        self.previewRMsList.blockSignals(False)
         self.refresh_plot()
 
     def refresh_plot(self):
         """Update the regression preview plot after user changes inputs"""
+        PLOT.clearItems()
         PLOT.clearGraphs()
-        ann.visible = False
-        ca_chan = drs.setting("CaChannel")
+        channel_to_preview = self.previewRatioSelector.currentData
+        norm_channel = drs.setting("NormChannel")
 
-        target_el = self.ratioPlotCombo.currentData
-        if not target_el:
+        if not channel_to_preview or not norm_channel:
             PLOT.replot()
             return
 
-        selected_rms = drs.setting("RMSelections").get(target_el, [])
+        # Check raw ratio channel exists
+        ratio_channel_name = f"{channel_to_preview}_{norm_channel}_Raw"
+        if ratio_channel_name not in data.timeSeriesNames(data.Intermediate):
+            PLOT.replot()
+            return
+
+        analyte_disp_name, _ = _parse_isotope_name(channel_to_preview)
+        norm_disp_name, _ = _parse_isotope_name(norm_channel)
+        if drs.setting("UseIsotopeLabels"):
+            analyte_disp_name = channel_to_preview
+            norm_disp_name = norm_channel
+
+        selected_rms = drs.setting("RMSelections").get(channel_to_preview, [])
         if len(selected_rms) < 2:
             PLOT.replot()
             return
@@ -1520,22 +1687,22 @@ class R3SettingsWidget(QtGui.QWidget):
             return
 
         # save current ratio selection, update combobox, and restore selection if still valid
-        prev_view = self.ratioViewCombo.currentText
-        self.ratioViewCombo.blockSignals(True)
-        self.ratioViewCombo.clear()
-        self.ratioViewCombo.addItem("Overview")
+        prev_view = self.previewBlockSelector.currentText
+        self.previewBlockSelector.blockSignals(True)
+        self.previewBlockSelector.clear()
+        self.previewBlockSelector.addItem("Overview")
         for i in range(len(blocks)):
-            self.ratioViewCombo.addItem(f"Block: {i + 1}")
-        self.ratioViewCombo.setCurrentText(
+            self.previewBlockSelector.addItem(f"Block: {i + 1}")
+        self.previewBlockSelector.setCurrentText(
             prev_view
             if prev_view
             in [
-                self.ratioViewCombo.itemText(i)
-                for i in range(self.ratioViewCombo.count)
+                self.previewBlockSelector.itemText(i)
+                for i in range(self.previewBlockSelector.count)
             ]
             else "Overview"
         )
-        self.ratioViewCombo.blockSignals(False)
+        self.previewBlockSelector.blockSignals(False)
 
         # prepare data for plotting
         all_x_global, all_y_global = [], []
@@ -1544,21 +1711,27 @@ class R3SettingsWidget(QtGui.QWidget):
 
         for block_idx, block in enumerate(blocks):
             result = get_block_regression_data(
-                block, target_el, ca_chan, selected_rms, drs.setting("MinRMsPerBlock")
+                block,
+                channel_to_preview,
+                norm_channel,
+                selected_rms,
+                drs.setting("MinRMsPerBlock"),
             )
             if not result:
                 continue
 
-            fit = result["fit"]
-            b_data = result["data"]
+            block_fit = result["fit"]
+            block_data = result["data"]
 
-            all_x_global.extend(b_data["x"])
-            all_y_global.extend(b_data["y"])
-            block_plot_data.append((block_idx, b_data["raw_stats"], b_data["rm_names"]))
+            all_x_global.extend(block_data["x"])
+            all_y_global.extend(block_data["y"])
+            block_plot_data.append(
+                (block_idx, block_data["raw_stats"], block_data["rm_names"])
+            )
 
-            max_x = np.max(b_data["x"]) * 1.1
+            max_x = np.max(block_data["x"]) * 1.1
             x_range = np.linspace(0, max_x, 50)
-            y_fit = fit["slope"] * x_range + fit["intercept"]
+            y_fit = block_fit["slope"] * x_range + block_fit["intercept"]
 
             block_fit_lines.append(
                 {
@@ -1566,11 +1739,11 @@ class R3SettingsWidget(QtGui.QWidget):
                     "x": x_range,
                     "y": y_fit,
                     "color": block_colors[block_idx],
-                    **fit,
+                    **block_fit,
                 }
             )
 
-        view_text = self.ratioViewCombo.currentText
+        view_text = self.previewBlockSelector.currentText
         show_overview = view_text == "Overview"
         fit_index = None if show_overview else int(view_text.split(":")[-1].strip()) - 1
 
@@ -1610,6 +1783,7 @@ class R3SettingsWidget(QtGui.QWidget):
         # plot/replot the data
         ann_fit_data = None
         if show_overview:
+            # Showing overview, so plot all block results plus means
             for line in block_fit_lines:
                 fg = PLOT.addGraph()
                 pen = QPen(line["color"])
@@ -1632,9 +1806,10 @@ class R3SettingsWidget(QtGui.QWidget):
 
             # Plot group means as solid circles with error bars
             for rm_name in selected_rms:
-
                 stats = gather_ratio_stats(
-                    target_el, ca_chan, rm_group=data.selectionGroup(rm_name)
+                    channel_to_preview,
+                    norm_channel,
+                    rm_group=data.selectionGroup(rm_name),
                 )
                 if not stats:
                     continue
@@ -1655,6 +1830,7 @@ class R3SettingsWidget(QtGui.QWidget):
                     len(block_fit_lines) // 2
                 ]
         else:
+            # Showing single block so plot just this block's data
             if fit_index is not None and 0 <= fit_index < len(block_plot_data):
                 line = next((l for l in block_fit_lines if l["idx"] == fit_index), None)
                 if line:
@@ -1679,11 +1855,14 @@ class R3SettingsWidget(QtGui.QWidget):
 
         # Annotate and scale axes
         if ann_fit_data:
-            ann.visible = True
+            ann = PLOT.annotate(
+                "", 0.015, 0.01, "ptAxisRectRatio", Qt.AlignLeft | Qt.AlignTop
+            )
 
         # Build annotation text with ODR parameters
         view_label = "overview" if show_overview else f"block {fit_index + 1}"
-        ann_text = f'<p style="color:black;font-size:9pt;line-height:1.15;"><b>{target_el}/{ca_chan}</b> ({view_label})'
+
+        ann_text = f'<p style="color:black;font-size:9pt;line-height:1.15;"><b>{analyte_disp_name}/{norm_disp_name}</b> ({view_label})'
 
         if ann_fit_data is not None:
             ann_text += (
@@ -1713,8 +1892,5 @@ class R3SettingsWidget(QtGui.QWidget):
 
 
 def settingsWidget():
-    try:
-        widget = R3SettingsWidget()
-        drs.setSettingsWidget(widget)
-    except Exception as e:
-        IoLog.error(f"Error creating settings widget: {e}")
+    widget = R3SettingsWidget()
+    drs.setSettingsWidget(widget)
