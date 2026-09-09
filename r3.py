@@ -25,6 +25,7 @@ import numpy as np
 from iolite import QtCore, QtGui
 from iolite.Qt import QColor, Qt
 from iolite.QtGui import QAction, QPen
+from iolite.ui import CommonUIPyInterface as CUI
 from iolite.ui import IolitePlotPyInterface as Plot
 from iolite.ui import IolitePlotSettingsDialog as PlotSettings
 from iolite.ui import QCPErrorBars, QCPRange
@@ -928,7 +929,6 @@ class OutputSetRow(QtGui.QWidget):
     """Encapsulates the UI and state for a single group of analyte/normaliser output settings."""
 
     dataChanged = QtCore.Signal()
-    addRequested = QtCore.Signal()
     removeRequested = QtCore.Signal(object)
 
     def __init__(self, parent_drs_widget, index, state=None):
@@ -939,32 +939,12 @@ class OutputSetRow(QtGui.QWidget):
         self.rm_names = parent_drs_widget.rmNames
         self.ref_mat_names = data.referenceMaterialNames()
 
-        main_layout = QtGui.QHBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Left Buttons Layout
-        btn_group = QtGui.QGroupBox(
-            " "
-        )  # hack to align... I'm sure there's a better way
-        btn_layout = QtGui.QHBoxLayout(btn_group)
-        self.removeBtn = QtGui.QToolButton()
-        self.removeBtn.setText("-")
-        self.removeBtn.setToolTip("Remove this output")
-        self.removeBtn.clicked.connect(lambda: self.removeRequested.emit(self))
-
-        self.addBtn = QtGui.QToolButton()
-        self.addBtn.setText("+")
-        self.addBtn.setToolTip("Add an output")
-        self.addBtn.clicked.connect(lambda checked=False: self.addRequested.emit())
-
-        btn_layout.addWidget(self.removeBtn)
-        btn_layout.addWidget(self.addBtn)
-        main_layout.addWidget(btn_group)
-        main_layout.addSpacing(10)
+        row_layout = QtGui.QHBoxLayout(self)
+        row_layout.setContentsMargins(0, 0, 0, 0)
 
         # Output parameters group
-        self.group = QtGui.QGroupBox(f"Set {index}")
-        output_group_layout = QtGui.QHBoxLayout(self.group)
+        rowBox = QtGui.QWidget()
+        output_set_layout = QtGui.QHBoxLayout(rowBox)
 
         self.analytesSelector = QtGui.QToolButton()
         self.analytesSelector.setText("Channels")
@@ -976,19 +956,19 @@ class OutputSetRow(QtGui.QWidget):
         )
         self.analytesSelector.setMenu(self.analytesMenu)
         self.analytesSelector.setPopupMode(QtGui.QToolButton.InstantPopup)
-        output_group_layout.addWidget(self.analytesSelector)
+        output_set_layout.addWidget(self.analytesSelector)
 
         lbl = QtGui.QLabel("/")
         lbl.setStyleSheet("font-size: 16px; font-weight: bold;")
-        output_group_layout.addWidget(lbl)
+        output_set_layout.addWidget(lbl)
 
         self.normCombo = QtGui.QComboBox()
         self.normCombo.addItems(self.all_channels)
         if state and state.get("normaliser"):
             self.normCombo.setCurrentText(state.get("normaliser"))
         self.current_norm = self.normCombo.currentText
-        output_group_layout.addWidget(self.normCombo)
-        output_group_layout.addSpacing(10)
+        output_set_layout.addWidget(self.normCombo)
+        output_set_layout.addSpacing(20)
 
         self.modeCombo = QtGui.QComboBox()
         self.modeCombo.addItems(
@@ -1000,25 +980,19 @@ class OutputSetRow(QtGui.QWidget):
 
         if state and state.get("mode"):
             self.modeCombo.setCurrentText(state.get("mode"))
-        output_group_layout.addWidget(self.modeCombo)
+        output_set_layout.addWidget(self.modeCombo)
 
-        output_group_layout.addSpacing(10)
-        main_layout.addWidget(self.group)
-        main_layout.addSpacing(10)
+        output_set_layout.addSpacing(30)
 
-        # Secondary Normalisation Side
-        sec_norm_group = QtGui.QGroupBox("Secondary normalisation")
-        sec_norm_layout = QtGui.QHBoxLayout(sec_norm_group)
-
-        self.secNormCheck = QtGui.QCheckBox("Enabled")
+        # Secondary Normalisation part
+        self.secNormCheck = QtGui.QCheckBox()
         if state:
             self.secNormCheck.setChecked(state.get("sec_norm_enabled", False))
         self.secNormCheck.setToolTip(
             "Apply a second normalisation factor derived from a reference material."
         )
-        sec_norm_layout.addWidget(self.secNormCheck)
-        sec_norm_layout.addSpacing(10)
-        sec_norm_layout.addLayout(sec_norm_layout)
+        output_set_layout.addWidget(self.secNormCheck)
+        output_set_layout.addWidget(QtGui.QLabel("Normalise"))
 
         self.snRmCombo = QtGui.QComboBox()
         self.snRmCombo.addItems(self.rm_names)
@@ -1030,13 +1004,20 @@ class OutputSetRow(QtGui.QWidget):
         if state and state.get("sec_norm_ref_material"):
             self.snRefCombo.setCurrentText(state["sec_norm_ref_material"])
 
-        sec_norm_layout.addWidget(QtGui.QLabel("Measured RM:"))
-        sec_norm_layout.addWidget(self.snRmCombo)
-        sec_norm_layout.addWidget(QtGui.QLabel("Ref Values:"))
-        sec_norm_layout.addWidget(self.snRefCombo)
+        output_set_layout.addWidget(self.snRmCombo)
+        output_set_layout.addWidget(QtGui.QLabel("to"))
+        output_set_layout.addWidget(self.snRefCombo)
 
-        main_layout.addWidget(sec_norm_group)
-        main_layout.addStretch()
+        row_layout.addWidget(rowBox)
+        row_layout.addSpacing(20)
+
+        self.removeBtn = QtGui.QToolButton()
+        self.removeBtn.setIcon(CUI().icon("remove"))
+        self.removeBtn.setToolTip("Remove this output")
+        self.removeBtn.clicked.connect(lambda: self.removeRequested.emit(self))
+        row_layout.addWidget(self.removeBtn)
+
+        row_layout.addStretch()
 
         # Connect signals
         self.analytesMenu.selectionChanged.connect(self._emit_changed)
@@ -1071,7 +1052,6 @@ class OutputSetRow(QtGui.QWidget):
 
     def setIndex(self, idx):
         self.index = idx
-        self.group.setTitle(f"Set {idx}")
         self.removeBtn.setEnabled(idx > 1)
 
     def getState(self):
@@ -1079,7 +1059,7 @@ class OutputSetRow(QtGui.QWidget):
             "analytes": list(self.analytesMenu.current_selection),
             "normaliser": self.normCombo.currentText,
             "mode": self.modeCombo.currentText,
-            "sec_norm_enabled": self.secNormCheck.isChecked,
+            "sec_norm_enabled": self.secNormCheck.isChecked(),
             "sec_norm_rm": self.snRmCombo.currentText,
             "sec_norm_ref_material": self.snRefCombo.currentText,
         }
@@ -1089,6 +1069,8 @@ class R3SettingsWidget(QtGui.QWidget):
     """
     Main UI widget.
     """
+
+    addRequested = QtCore.Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1248,9 +1230,22 @@ class R3SettingsWidget(QtGui.QWidget):
         self.setup_bottom_row()
 
     def setup_outputs_group(self):
-        self.outputsContainer = QtGui.QWidget()
+        self.outputsContainer = QtGui.QGroupBox("Outputs")
         self.outputsLayout = QtGui.QVBoxLayout(self.outputsContainer)
-        self.outputsLayout.setContentsMargins(0, 0, 0, 0)
+        self.outputRowsLayout = QtGui.QVBoxLayout()
+        self.outputsLayout.addLayout(self.outputRowsLayout)
+
+        btn_layout = QtGui.QHBoxLayout()
+        btn_layout.setContentsMargins(11, 7, 7, 7)
+        self.addBtn = QtGui.QToolButton()
+        self.addBtn.setIcon(CUI().icon("plus"))
+        self.addBtn.clicked.connect(lambda checked=False: self.addRequested.emit())
+        btn_layout.addWidget(self.addBtn)
+        btn_layout.addWidget(QtGui.QLabel("Add an output set"))
+        btn_layout.addStretch()
+        self.outputsLayout.addLayout(btn_layout)
+        self.addRequested.connect(self.add_output_row)
+
         self.mainLayout.addWidget(self.outputsContainer)
 
         self.outputRows = []
@@ -1267,12 +1262,10 @@ class R3SettingsWidget(QtGui.QWidget):
 
         row = OutputSetRow(self, idx, state)
         row.dataChanged.connect(self.save_outputs_state)
-        row.addRequested.connect(self.add_output_row)
         row.removeRequested.connect(self.remove_output_row)
 
         self.outputRows.append(row)
-        self.outputsLayout.addWidget(row)
-        self.outputsLayout.addSpacing(10)
+        self.outputRowsLayout.addWidget(row)
         self.update_row_indices()
         self.save_outputs_state()
 
@@ -1280,7 +1273,7 @@ class R3SettingsWidget(QtGui.QWidget):
         if len(self.outputRows) <= 1:
             return
         self.outputRows.remove(row)
-        self.outputsLayout.removeWidget(row)
+        self.outputRowsLayout.removeWidget(row)
         row.deleteLater()
         self.update_row_indices()
         self.save_outputs_state()
