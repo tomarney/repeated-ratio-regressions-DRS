@@ -4,7 +4,7 @@
 #/ Authors: Thomas Arney
 #/ Description: Calibration by time-varying regressions of measured and reference molar ratios.
 #/ References: Tang et al. (2025, JAAS) DOI: 10.1039/D5JA00333D
-#/ Version: 0.6
+#/ Version: 1.0
 #/ Contact: t.arney@soton.ac.uk
 
 
