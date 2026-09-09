@@ -1624,7 +1624,7 @@ class R3SettingsWidget(QtGui.QWidget):
             mode = o_set["mode"]
             for analyte in o_set["analytes"]:
                 out_name = _get_output_name(analyte, norm, mode)
-                disp_text = f"{out_name} (Output {i + 1})"
+                disp_text = f"{out_name}"
                 self.previewRatioSelector.addItem(
                     disp_text, (out_name, analyte, norm, mode)
                 )
@@ -1731,6 +1731,7 @@ class R3SettingsWidget(QtGui.QWidget):
             return
 
         out_name, target_ch, norm_channel, mode = combo_data
+
         ratio_channel_name = f"{target_ch}_{norm_channel}_Raw"
 
         if ratio_channel_name not in data.timeSeriesNames(data.Intermediate):
@@ -1746,7 +1747,7 @@ class R3SettingsWidget(QtGui.QWidget):
         if not blocks:
             return
 
-        # save current ratio selection, update combobox, and restore selection if still valid
+        # save current block selection, update combobox, and restore selection if still valid
         prev_view = self.previewBlockSelector.currentText
         self.previewBlockSelector.blockSignals(True)
         self.previewBlockSelector.clear()
@@ -1790,8 +1791,11 @@ class R3SettingsWidget(QtGui.QWidget):
                 (block_idx, block_data["raw_stats"], block_data["rm_names"])
             )
 
-            max_x = np.max(block_data["x"]) * 1.1
-            x_range = np.linspace(0, max_x, 50)
+            max_x = np.max(block_data["x"])
+            min_x = np.min(block_data["x"])
+            x_range = np.linspace(min(0, min_x) * 10, max_x * 10, 50)
+            if mode == "Delta notation":
+                x_range = np.linspace(-max_x * 10, max_x * 10, 50)
             y_fit = block_fit["slope"] * x_range + block_fit["intercept"]
 
             block_fit_lines.append(
@@ -1807,6 +1811,13 @@ class R3SettingsWidget(QtGui.QWidget):
         view_text = self.previewBlockSelector.currentText
         show_overview = view_text == "Overview"
         fit_index = None if show_overview else int(view_text.split(":")[-1].strip()) - 1
+
+        if mode == "Delta notation":
+            PLOT.left().label = f"Reference {out_name} (‰)"
+            PLOT.bottom().label = f"Measured {target_ch}/{norm_channel}"
+        else:
+            PLOT.left().label = f"Reference {out_name}"
+            PLOT.bottom().label = f"Measured {out_name}"
 
         def plot_point_with_error(x, y, x_err, y_err, color, size, hollow=True):
             g = PLOT.addGraph()
@@ -1935,10 +1946,24 @@ class R3SettingsWidget(QtGui.QWidget):
         if ann_fit_data:
             ann.text = ann_text
 
+        def _get_robust_ax_lims(data, margin=0.2, pad_factor=(1.0, 1.0)):
+            lo = min(data)
+            if mode != "Delta notation":
+                lo = min(lo, 0.0)
+            hi = max(data)
+            pad = (hi - lo) * margin
+            return lo - pad * pad_factor[0], hi + pad * pad_factor[1]
+
         PLOT.rescaleAxes()
-        if all_x_global:
-            PLOT.left().setRange(QCPRange(0, max(all_y_global) * 1.2))
-            PLOT.bottom().setRange(QCPRange(0, max(all_x_global) * 1.2))
+
+        if all_x_global and all_y_global:
+            y_lims = _get_robust_ax_lims(all_y_global, pad_factor=(1.0, 2))
+            x_lims = _get_robust_ax_lims(all_x_global)
+            if mode != "Delta notation":
+                y_lims = (0, y_lims[1])
+                x_lims = (0, x_lims[1])
+            PLOT.left().setRange(QCPRange(*y_lims))
+            PLOT.bottom().setRange(QCPRange(*x_lims))
 
         PLOT.replot()
 
