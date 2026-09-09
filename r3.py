@@ -1232,6 +1232,7 @@ class R3SettingsWidget(QtGui.QWidget):
     def setup_outputs_group(self):
         self.outputsContainer = QtGui.QGroupBox("Outputs")
         self.outputsLayout = QtGui.QVBoxLayout(self.outputsContainer)
+
         self.outputRowsLayout = QtGui.QVBoxLayout()
         self.outputsLayout.addLayout(self.outputRowsLayout)
 
@@ -1242,7 +1243,18 @@ class R3SettingsWidget(QtGui.QWidget):
         self.addBtn.clicked.connect(lambda checked=False: self.addRequested.emit())
         btn_layout.addWidget(self.addBtn)
         btn_layout.addWidget(QtGui.QLabel("Add an output set"))
+        btn_layout.addSpacing(50)
+
+        btn_layout.addWidget(QtGui.QLabel("Apply preset:"))
+        self.presetCombo = QtGui.QComboBox()
+        self.presetCombo.addItems(["Element/Ca ratios", "Boron isotopes"])
+        btn_layout.addWidget(self.presetCombo)
+
+        self.applyPresetBtn = QtGui.QPushButton("Apply")
+        self.applyPresetBtn.clicked.connect(self.apply_preset)
+        btn_layout.addWidget(self.applyPresetBtn)
         btn_layout.addStretch()
+
         self.outputsLayout.addLayout(btn_layout)
         self.addRequested.connect(self.add_output_row)
 
@@ -1251,6 +1263,89 @@ class R3SettingsWidget(QtGui.QWidget):
         self.outputRows = []
         saved_sets = drs.setting("OutputSets")
         for state in saved_sets:
+            self.add_output_row(state)
+
+    def apply_preset(self):
+        preset_name = self.presetCombo.currentText
+        if preset_name == "Element/Ca ratios":
+            ca_ch = next(
+                (
+                    ch
+                    for ch in self.allIsotopeChannels
+                    if ch == "Ca" or (_parse_isotope_name(ch)[0] == "Ca")
+                ),
+                None,
+            )
+            if not ca_ch:
+                IoLog.error("Preset 'Element/Ca ratios' failed: No Ca channel found.")
+                return
+
+            jcp_rm = next(
+                (rm for rm in self.rmNames if rm.startswith("JCp")), self.rmNames[0]
+            )
+            ref_mats = data.referenceMaterialNames()
+            jcp_ref = next((rm for rm in ref_mats if rm.startswith("JCp")), ref_mats[0])
+
+            analytes = [ch for ch in self.allIsotopeChannels if ch != ca_ch]
+            if not analytes:
+                IoLog.error(
+                    "Preset 'Element/Ca ratios' failed: No analyte channels available."
+                )
+                return
+
+            new_states = [
+                {
+                    "analytes": analytes,
+                    "normaliser": ca_ch,
+                    "mode": "Elemental ratios",
+                    "sec_norm_enabled": True,
+                    "sec_norm_rm": jcp_rm,
+                    "sec_norm_ref_material": jcp_ref,
+                }
+            ]
+
+        elif preset_name == "Boron isotopes":
+            required = ["B11", "B10", "C12"]
+            missing = [ch for ch in required if ch not in self.allIsotopeChannels]
+            if missing:
+                IoLog.error(
+                    f"Preset 'Boron isotopes' failed: Missing required channels ({', '.join(missing)})."
+                )
+                return
+
+            ref_mats = data.referenceMaterialNames()
+            default_rm = self.rmNames[0] if self.rmNames else ""
+            default_ref = ref_mats[0] if ref_mats else ""
+
+            new_states = [
+                {
+                    "analytes": ["B11"],
+                    "normaliser": "B10",
+                    "mode": "Delta notation",
+                    "sec_norm_enabled": False,
+                    "sec_norm_rm": default_rm,
+                    "sec_norm_ref_material": default_ref,
+                },
+                {
+                    "analytes": ["B11"],
+                    "normaliser": "C12",
+                    "mode": "Isotopic ratios",
+                    "sec_norm_enabled": False,
+                    "sec_norm_rm": default_rm,
+                    "sec_norm_ref_material": default_ref,
+                },
+            ]
+        else:
+            return
+
+        # Clear existing output rows
+        while self.outputRows:
+            row = self.outputRows.pop()
+            self.outputRowsLayout.removeWidget(row)
+            row.deleteLater()
+
+        # Add preset output rows
+        for state in new_states:
             self.add_output_row(state)
 
     def add_output_row(self, state=None):
