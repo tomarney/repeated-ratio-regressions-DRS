@@ -1090,6 +1090,7 @@ class R3SettingsWidget(QtGui.QWidget):
         self.setup_ui()
         self.connect_signals()
         QtGui.QApplication.processEvents()
+        self.preload_preset()
 
     def init_default_settings(self):
         drs.setSetting("IndexChannel", self.defaultChannelName)
@@ -1621,6 +1622,17 @@ class R3SettingsWidget(QtGui.QWidget):
         )
 
         self.update_previewed_ratio_combo()
+
+    def preload_preset(self):
+        """Preload a preset on first run based on the available channels"""
+        # test for boron isotopes channels
+        b_channels = {"B10", "B11", "C12"}
+        if b_channels.issubset(set(self.allIsotopeChannels)):
+            self.presetCombo.setCurrentText("Boron isotopes")
+        else:
+            self.presetCombo.setCurrentText("Element/Ca ratios")
+        # not applying automatically in case we're wrong. One click is convenient enough.
+        # self.apply_preset()
 
     def set_all_rms_checked(self, state):
         try:
