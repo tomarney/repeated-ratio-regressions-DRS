@@ -4,7 +4,7 @@
 #/ Authors: Thomas Arney
 #/ Description: Calibration by time-varying regressions of measured and reference molar ratios.
 #/ References: Tang et al. (2025, JAAS) DOI: 10.1039/D5JA00333D
-#/ Version: 2.0
+#/ Version: 2.1.0
 #/ Contact: t.arney@soton.ac.uk
 
 
@@ -120,11 +120,6 @@ def lm(B, x):
     return B[0] * x + B[1]
 
 
-def R_squared(observed, predicted):
-    """Calculate R-squared goodness of fit."""
-    return 1.0 - (np.var((observed - predicted)) / np.var(observed))
-
-
 def fit_odr(x, y, x_err, y_err):
     """Fit ODR linear model"""
     linear_model = odr.Model(lm)
@@ -139,10 +134,7 @@ def fit_odr(x, y, x_err, y_err):
 
     odr_data = odr.RealData(x, y, sx=x_err, sy=y_err)
     odr_instance = odr.ODR(odr_data, linear_model, beta0=[slope_init, 0.0])
-    odr_out = odr_instance.run()
-    r_sq = R_squared(y, lm(odr_out.beta, x))
-
-    return odr_out, r_sq
+    return odr_instance.run()
 
 
 # --- Data gathering helpers ---
@@ -191,7 +183,7 @@ def gather_ratio_stats(
     target_isotope, norm_channel, mode, selection=None, rm_group=None
 ):
     """
-    Gather measured and reference values and uncertainties for a given ratio.
+    Gather measured and reference values and 2s uncertainties for a given ratio.
 
     Args:
         target_isotope: str, isotope name (e.g. "Sr88")
@@ -238,7 +230,7 @@ def gather_ratio_stats(
             # For individual selection, use data.result()
             result = data.result(selection, ts)
             meas_mean = result.value()
-            meas_unc = result.uncertainty()
+            meas_unc = result.uncertaintyAs2SE()
         else:
             # For group, use stats()
             stats = sg.stats(ts)
@@ -359,24 +351,41 @@ def get_block_regression_data(
     """
     rm_data = []
     valid_rm_names = []
-
-    for rm_group_name, sel_list in block.rm_sels.items():
-        if selected_rms is not None and rm_group_name not in selected_rms:
+    replicate_stats = {}
+    for rm_name, sel_list in block.rm_sels.items():
+        if selected_rms is not None and rm_name not in selected_rms:
             continue
 
+        stats_list = []
         for sel in sel_list:
             stats = gather_ratio_stats(
                 target_isotope, norm_channel_name, mode, selection=sel
             )
             if stats:
-                rm_data.append(stats)
-                valid_rm_names.append(rm_group_name)
-
-    if len(set(valid_rm_names)) < min_rms_per_block:
+                stats_list.append(stats)
+        if not stats_list:
+            continue
+        values = np.array([v[0] for v in stats_list], dtype=float)
+        one_se = np.array([v[2] / 2.0 for v in stats_list], dtype=float)
+        weights = 1.0 / np.square(one_se)
+        combined_mean = float(np.sum(weights * values) / np.sum(weights))
+        propagated_1se = float(np.sqrt(1.0 / np.sum(weights)))
+        observed_1se = (
+            float(np.std(values, ddof=1) / np.sqrt(len(values)))
+            if len(values) > 1
+            else 0.0
+        )
+        combined_1se = max(propagated_1se, observed_1se)
+        ref_val = float(stats_list[0][1])
+        ref_2sd = float(stats_list[0][3])
+        rm_data.append((combined_mean, ref_val, combined_1se, ref_2sd / 2.0))
+        valid_rm_names.append(rm_name)
+        replicate_stats[rm_name] = stats_list
+    if len(valid_rm_names) < min_rms_per_block:
         return None
 
     x, y, x_err, y_err = (np.array(vals) for vals in zip(*rm_data))
-    odr_out, r_sq = fit_odr(x, y, x_err, y_err)
+    odr_out = fit_odr(x, y, x_err, y_err)
 
     slope_unc = odr_out.sd_beta[0] if hasattr(odr_out, "sd_beta") else 0.0
     intercept_unc = odr_out.sd_beta[1] if hasattr(odr_out, "sd_beta") else 0.0
@@ -385,7 +394,6 @@ def get_block_regression_data(
         "fit": {
             "slope": float(odr_out.beta[0]),
             "intercept": float(odr_out.beta[1]),
-            "r_squared": float(r_sq),
             "slope_unc": float(slope_unc),
             "intercept_unc": float(intercept_unc),
         },
@@ -396,6 +404,7 @@ def get_block_regression_data(
             "y_err": y_err,
             "rm_names": valid_rm_names,
             "raw_stats": rm_data,
+            "replicate_stats": replicate_stats,
         },
     }
 
@@ -407,6 +416,7 @@ def fit_regressions_for_all_blocks(
     mode,
     min_rms_per_block=2,
     rm_selections=None,
+    log_warnings=True,
 ):
     """
     Fit regressions for all blocks and elements in an output set.
@@ -420,23 +430,10 @@ def fit_regressions_for_all_blocks(
         intercepts = []
         slopes_unc = []
         intercepts_unc = []
-        r_squared = []
 
         selected_rms = rm_selections.get(output_name, []) if rm_selections else None
 
         for block_num, block in enumerate(blocks):
-            if selected_rms is not None:
-                viable_rms = sum(1 for rm in block.rm_sels if rm in selected_rms)
-            else:
-                viable_rms = len(block.rm_sels)
-
-            if viable_rms < min_rms_per_block:
-                IoLog.warning(
-                    f"Block has {viable_rms} valid RM types for {output_name}. "
-                    f"Need at least {min_rms_per_block}. Skipping."
-                )
-                continue
-
             result = get_block_regression_data(
                 block,
                 istp_name,
@@ -446,7 +443,8 @@ def fit_regressions_for_all_blocks(
                 min_rms_per_block=min_rms_per_block,
             )
             if result is None:
-                IoLog.warning(f"Could not fit {output_name} for block {block_num}")
+                if log_warnings:
+                    IoLog.warning(f"Could not fit {output_name} for block {block_num}")
                 continue
 
             fit_result = result["fit"]
@@ -455,8 +453,6 @@ def fit_regressions_for_all_blocks(
             intercepts.append(fit_result["intercept"])
             slopes_unc.append(fit_result["slope_unc"])
             intercepts_unc.append(fit_result["intercept_unc"])
-            r_squared.append(fit_result["r_squared"])
-
         if slopes:
             results_dict[istp_name] = {
                 "times": np.array(times),
@@ -464,7 +460,6 @@ def fit_regressions_for_all_blocks(
                 "intercepts": np.array(intercepts),
                 "slopes_unc": np.array(slopes_unc),
                 "intercepts_unc": np.array(intercepts_unc),
-                "r_squared": np.array(r_squared),
             }
 
     return results_dict
@@ -1912,12 +1907,15 @@ class R3SettingsWidget(QtGui.QWidget):
         show_overview = view_text == "Overview"
         fit_index = None if show_overview else int(view_text.split(":")[-1].strip()) - 1
 
+        x_unc_label = "2SD" if show_overview else "2SE"
         if mode == "Delta notation":
-            PLOT.left().label = f"Reference {out_name} (‰)"
-            PLOT.bottom().label = f"Measured {target_ch}/{norm_channel}"
+            PLOT.left().label = f"Reference {out_name} (‰) (±2SD)"
+            PLOT.bottom().label = (
+                f"Measured {target_ch}/{norm_channel} (±{x_unc_label})"
+            )
         else:
-            PLOT.left().label = f"Reference {out_name}"
-            PLOT.bottom().label = f"Measured {out_name}"
+            PLOT.left().label = f"Reference {out_name} (±2SD)"
+            PLOT.bottom().label = f"Measured {out_name} (±{x_unc_label})"
 
         def plot_point_with_error(x, y, x_err, y_err, color, size, hollow=True):
             g = PLOT.addGraph()
@@ -2009,8 +2007,8 @@ class R3SettingsWidget(QtGui.QWidget):
                     plot_point_with_error(
                         meas_mean,
                         ref_val,
-                        meas_err,
-                        ref_err,
+                        meas_err * 2.0,
+                        ref_err * 2.0,
                         get_color(name),
                         6.0,
                         False,
@@ -2024,25 +2022,26 @@ class R3SettingsWidget(QtGui.QWidget):
 
         # Build annotation text with ODR parameters
         view_label = "overview" if show_overview else f"block {fit_index + 1}"
-        ann_text = f'<p style="color:black;font-size:9pt;line-height:1.15;"><b>{out_name}</b> ({view_label})'
+        pstyle = (
+            "margin-bottom:8px;margin-top:8px;color:black;line-height:1.15;font-size:"
+        )
+        ann_text = f'<p style="{pstyle}12pt;"><b>{out_name}</b> ({view_label})<p>'
 
         if ann_fit_data is not None:
             ann_text += (
-                "<br />Typical fit (median slope):"
+                f"<p style='{pstyle}10pt;'>Typical fit (median slope):"
                 if show_overview
-                else "<br />ODR fit parameters:"
+                else f"<p style='{pstyle}10pt;'>ODR fit parameters:"
             )
             slope = ann_fit_data["slope"]
-            slope_unc = (ann_fit_data["slope_unc"] * 2) / slope * 100
+            slope_unc = ann_fit_data["slope_unc"] * 2
             intercept = ann_fit_data["intercept"]
             intercept_unc = ann_fit_data["intercept_unc"] * 2
-            r_sq = ann_fit_data["r_squared"]
-
-            ann_text += f"<br />slope = {slope:.3g} ± {slope_unc:.1f}% (2RSD)"
-            ann_text += f"<br />intercept = {intercept:.3g} ± {intercept_unc:.3g} (2SD)"
-            ann_text += f"<br />R² = {r_sq:.3f}"
-
-        ann_text += "</p>"
+            ann_text += (
+                f"<br />slope = {slope:.3g} ± {slope_unc:.3g} (2SD)"
+                f"<br />intercept = {intercept:.3g} ± {intercept_unc:.3g} (2SD)"
+                "</p>"
+            )
         if ann_fit_data:
             ann.text = ann_text
 
