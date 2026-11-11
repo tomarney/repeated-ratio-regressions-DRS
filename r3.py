@@ -4,7 +4,7 @@
 #/ Authors: Thomas Arney
 #/ Description: Calibration by time-varying regressions of measured and reference molar ratios.
 #/ References: Tang et al. (2025, JAAS) DOI: 10.1039/D5JA00333D
-#/ Version: 2.1.0
+# / Version: 2.1.0
 #/ Contact: t.arney@soton.ac.uk
 
 
@@ -465,6 +465,60 @@ def fit_regressions_for_all_blocks(
     return results_dict
 
 
+def interpolate_regression_parameters(reg_data, target_times, spline_type):
+    """Shared interpolation used by runDRS and leave-one-out preview."""
+    times = np.asarray(reg_data["times"], float)
+    slopes = np.asarray(reg_data["slopes"], float)
+    intercepts = np.asarray(reg_data["intercepts"], float)
+    su = np.asarray(reg_data["slopes_unc"], float)
+    iu = np.asarray(reg_data["intercepts_unc"], float)
+    if len(times) < 2:
+        return None, None
+    su = np.where(su <= 0, np.abs(slopes) * 0.05, su)
+    iu = np.where(iu <= 0, 1e-6, iu)
+    return (
+        data.spline(times, slopes, su, spline_type, target_times),
+        data.spline(times, intercepts, iu, spline_type, target_times),
+    )
+
+
+def calculate_global_loo(
+    blocks, analyte, norm, mode, selected_rms, min_rms, spline_type, index_channel
+):
+    """Omit each RM session-wide, refit blocks, and predict omitted selections."""
+    out = _get_output_name(analyte, norm, mode)
+    it = np.asarray(index_channel.time(), float)
+    ans = {}
+    for omitted in selected_rms:
+        train = [r for r in selected_rms if r != omitted]
+        fits = fit_regressions_for_all_blocks(
+            blocks, [analyte], norm, mode, min_rms, {out: train}, log_warnings=False
+        )
+        if analyte not in fits:
+            continue
+        try:
+            ms, bs = interpolate_regression_parameters(fits[analyte], it, spline_type)
+            if ms is None:
+                continue
+            ref = float(data.referenceMaterialData(omitted)[out].value())
+            preds = []
+            for sel in data.selectionGroup(omitted).selections():
+                st = gather_ratio_stats(analyte, norm, mode, selection=sel)
+                if not st:
+                    continue
+                t = sel.midTimestamp if not sel.isLinked() else sel.linkedMidTimestamp()
+                j = int(np.argmin(np.abs(it - float(t))))
+                preds.append(float(ms[j] * st[0] + bs[j]))
+            if not preds:
+                continue
+            pred = float(np.mean(preds))
+            acc = np.nan if ref == 0 else ((pred - ref) / (ref)) * 100.0
+            ans[omitted] = {"prediction": pred, "accuracy": acc}
+        except Exception as e:
+            IoLog.warning(f"LOO failed for {out}/{omitted}: {e}")
+    return ans
+
+
 def fit_splines_for_one_ratio(
     block_reg_results,
     isotope_name,
@@ -496,15 +550,9 @@ def fit_splines_for_one_ratio(
         )
         return None, None
 
-    slopes_unc = np.where(slopes_unc <= 0, np.abs(slopes) * 0.05, slopes_unc)
-    intercepts_unc = np.where(intercepts_unc <= 0, 1e-6, intercepts_unc)
-
     try:
-        slope_spl = data.spline(
-            times, slopes, slopes_unc, spline_type, indexChannel.time()
-        )
-        intercept_spl = data.spline(
-            times, intercepts, intercepts_unc, spline_type, indexChannel.time()
+        slope_spl, intercept_spl = interpolate_regression_parameters(
+            reg_data, indexChannel.time(), spline_type
         )
     except Exception as e:
         IoLog.error(f"Failed to create splines for {out_name}: {e}")
@@ -1399,7 +1447,7 @@ class R3SettingsWidget(QtGui.QWidget):
         previewControlsRow = QtGui.QHBoxLayout()
         self.previewRatioSelector = QtGui.QComboBox(self.contentWidget)
         self.previewBlockSelector = QtGui.QComboBox(self.contentWidget)
-        self.previewBlockSelector.addItems(["Overview", "Block: 1"])
+        self.previewBlockSelector.addItems(["Leave-one-out", "Overview", "Block: 1"])
 
         previewControlsRow.addWidget(self.previewRatioSelector, 1)
         previewControlsRow.addWidget(self.previewBlockSelector)
@@ -1407,12 +1455,63 @@ class R3SettingsWidget(QtGui.QWidget):
         rmLayout.addWidget(QtGui.QLabel("Preview:"))
         rmLayout.addLayout(previewControlsRow)
         rmLayout.addSpacing(10)
-        rmLayout.addWidget(QtGui.QLabel("Reference materials:"))
 
+        # Header
+        rmHeaderWidget = QtGui.QWidget()
+        rmHeaderLayout = QtGui.QHBoxLayout(rmHeaderWidget)
+        rmHeaderLayout.setContentsMargins(0, 0, 0, 0)
+        rmHeaderLayout.setSpacing(0)
+
+        rmNameHeader = QtGui.QLabel("Reference Material")
+        rmAccuracyHeader = QtGui.QLabel("LOO Accuracy")
+
+        rmNameHeader.setStyleSheet("font-weight: bold;")
+        rmAccuracyHeader.setStyleSheet("font-weight: bold;")
+        rmAccuracyHeader.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        rmHeaderLayout.addWidget(rmNameHeader, 1)
+        rmHeaderLayout.addWidget(rmAccuracyHeader)
+
+        rmLayout.addWidget(rmHeaderWidget)
+
+        # Two independent lists, side by side
+        rmListsWidget = QtGui.QWidget()
+        rmListsLayout = QtGui.QHBoxLayout(rmListsWidget)
+        rmListsLayout.setContentsMargins(0, 0, 0, 0)
+        rmListsLayout.setSpacing(0)
+
+        # Original RM list
         self.previewRMsList = QtGui.QListWidget(self.contentWidget)
         self.previewRMsList.setSelectionMode(QtGui.QAbstractItemView.NoSelection)
         self.previewRMsList.setMinimumHeight(200)
-        rmLayout.addWidget(self.previewRMsList)
+        self.previewRMsList.setFixedWidth(200)
+
+        # New accuracy column
+        self.previewAccuracyList = QtGui.QListWidget(self.contentWidget)
+        self.previewAccuracyList.setSelectionMode(QtGui.QAbstractItemView.NoSelection)
+        self.previewAccuracyList.setFocusPolicy(Qt.NoFocus)
+        self.previewAccuracyList.setFixedWidth(50)
+
+        self.previewAccuracyList.setFont(self.previewRMsList.font)
+
+        # Prevent independent vertical scrolling
+        self.previewAccuracyList.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # Avoid a second visible frame
+        self.previewAccuracyList.setFrameShape(QtGui.QFrame.NoFrame)
+
+        rmListsLayout.addWidget(self.previewRMsList, 1)
+        rmListsLayout.addWidget(self.previewAccuracyList)
+
+        rmLayout.addWidget(rmListsWidget)
+
+        # Synchronise scrolling
+        self.previewRMsList.verticalScrollBar().valueChanged.connect(
+            self.previewAccuracyList.verticalScrollBar().setValue
+        )
+
+        # Match row spacing
+        self.previewAccuracyList.setSpacing(self.previewRMsList.spacing)
 
         self.missingUncLabel = QtGui.QLabel("* missing uncertainty in ref. value")
         self.missingUncLabel.setStyleSheet("font-style: italic; font-size: 9pt;")
@@ -1600,7 +1699,7 @@ class R3SettingsWidget(QtGui.QWidget):
             )
         )
         self.splineTypeSelector.currentTextChanged.connect(
-            lambda t: drs.setSetting("SplineType", t)
+            lambda t: (drs.setSetting("SplineType", t), self.refresh_plot())
         )
         self.indexComboBox.currentTextChanged.connect(
             lambda t: drs.setSetting("IndexChannel", t)
@@ -1738,6 +1837,7 @@ class R3SettingsWidget(QtGui.QWidget):
         """Update the list of RMs when the user changes the previewed ratio"""
         self.previewRMsList.blockSignals(True)
         self.previewRMsList.clear()
+        self.previewAccuracyList.clear()
 
         combo_data = self.previewRatioSelector.currentData
         if not combo_data:
@@ -1807,6 +1907,26 @@ class R3SettingsWidget(QtGui.QWidget):
 
             item.setText(display_text)
             self.previewRMsList.addItem(item)
+            accuracy_item = QtGui.QListWidgetItem("")
+            accuracy_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            accuracy_item.setFlags(Qt.NoItemFlags)
+
+            self.previewAccuracyList.addItem(accuracy_item)
+
+            # Identical row heights in both lists.
+            row_height = (
+                max(
+                    self.previewRMsList.fontMetrics().height(),
+                    self.previewAccuracyList.fontMetrics().height(),
+                    12,  # RM colour icon height
+                )
+                + 4
+            )
+
+            row_size = QtCore.QSize(0, row_height)
+
+            item.setSizeHint(row_size)
+            accuracy_item.setSizeHint(row_size)
 
         self.missingUncLabel.setVisible(has_missing_unc_any)
         self.fixUncCheck.setEnabled(has_missing_unc_any)
@@ -1814,6 +1934,27 @@ class R3SettingsWidget(QtGui.QWidget):
 
         self.previewRMsList.blockSignals(False)
         self.refresh_plot()
+
+    def update_loo_accuracy_labels(self, loo_results):
+        """Update the separate LOO accuracy column."""
+
+        for i in range(self.previewRMsList.count):
+            rm_item = self.previewRMsList.item(i)
+            accuracy_item = self.previewAccuracyList.item(i)
+
+            name = rm_item.data(Qt.UserRole)
+            result = loo_results.get(name)
+
+            if result and np.isfinite(result["accuracy"]):
+                accuracy_text = f"{result['accuracy']:.2g}%"
+
+            elif rm_item.checkState() == Qt.Checked:
+                accuracy_text = "n/a"
+
+            else:
+                accuracy_text = ""
+
+            accuracy_item.setText(accuracy_text)
 
     def refresh_plot(self):
         """Update the regression preview plot after user changes inputs"""
@@ -1846,6 +1987,7 @@ class R3SettingsWidget(QtGui.QWidget):
         prev_view = self.previewBlockSelector.currentText
         self.previewBlockSelector.blockSignals(True)
         self.previewBlockSelector.clear()
+        self.previewBlockSelector.addItem("Leave-one-out")
         self.previewBlockSelector.addItem("Overview")
         for i in range(len(blocks)):
             self.previewBlockSelector.addItem(f"Block: {i + 1}")
@@ -1856,7 +1998,7 @@ class R3SettingsWidget(QtGui.QWidget):
                 self.previewBlockSelector.itemText(i)
                 for i in range(self.previewBlockSelector.count)
             ]
-            else "Overview"
+            else "Leave-one-out"
         )
         self.previewBlockSelector.blockSignals(False)
 
@@ -1903,11 +2045,28 @@ class R3SettingsWidget(QtGui.QWidget):
                 }
             )
 
-        view_text = self.previewBlockSelector.currentText
-        show_overview = view_text == "Overview"
-        fit_index = None if show_overview else int(view_text.split(":")[-1].strip()) - 1
+        loo_results = calculate_global_loo(
+            blocks,
+            target_ch,
+            norm_channel,
+            mode,
+            selected_rms,
+            drs.setting("MinRMsPerBlock"),
+            drs.setting("SplineType"),
+            data.timeSeries(drs.setting("IndexChannel")),
+        )
+        self.update_loo_accuracy_labels(loo_results)
 
-        x_unc_label = "2SD" if show_overview else "2SE"
+        view_text = self.previewBlockSelector.currentText
+        show_loo = view_text == "Leave-one-out"
+        show_overview = view_text == "Overview"
+        fit_index = (
+            None
+            if (show_loo or show_overview)
+            else int(view_text.split(":")[-1].strip()) - 1
+        )
+
+        x_unc_label = "2SD" if (show_loo or show_overview) else "2SE"
         if mode == "Delta notation":
             PLOT.left().label = f"Reference {out_name} (‰) (±2SD)"
             PLOT.bottom().label = (
@@ -1952,7 +2111,28 @@ class R3SettingsWidget(QtGui.QWidget):
 
         # plot/replot the data
         ann_fit_data = None
-        if show_overview:
+        if show_loo:
+            for rm_name in selected_rms:
+                st = gather_ratio_stats(
+                    target_ch, norm_channel, mode, rm_group=data.selectionGroup(rm_name)
+                )
+                r = loo_results.get(rm_name)
+                if st and r:
+                    g = PLOT.addGraph()
+                    g.setLineStyle("lsNone")
+                    g.setScatterStyle(
+                        "ssCross", 10.0, QtGui.QColor(0, 0, 0), QtGui.QColor(0, 0, 0)
+                    )
+                    g.setData(np.array([st[0]]), np.array([r["prediction"]]))
+            for rm_name in selected_rms:
+                st = gather_ratio_stats(
+                    target_ch, norm_channel, mode, rm_group=data.selectionGroup(rm_name)
+                )
+                if st:
+                    plot_point_with_error(
+                        st[0], st[1], st[2], st[3], get_color(rm_name), 7.0, False
+                    )
+        elif show_overview:
             # Showing overview, so plot all block results plus means
             for line in block_fit_lines:
                 fg = PLOT.addGraph()
@@ -2015,18 +2195,34 @@ class R3SettingsWidget(QtGui.QWidget):
                     )
 
         # Annotate and scale axes
-        if ann_fit_data:
+        if ann_fit_data or show_loo:
             ann = PLOT.annotate(
                 "", 0.015, 0.01, "ptAxisRectRatio", Qt.AlignLeft | Qt.AlignTop
             )
 
         # Build annotation text with ODR parameters
-        view_label = "overview" if show_overview else f"block {fit_index + 1}"
+        view_label = (
+            "leave-one-out"
+            if show_loo
+            else ("overview" if show_overview else f"block {fit_index + 1}")
+        )
         pstyle = (
             "margin-bottom:8px;margin-top:8px;color:black;line-height:1.15;font-size:"
         )
         ann_text = f'<p style="{pstyle}12pt;"><b>{out_name}</b> ({view_label})<p>'
 
+        if show_loo:
+            vals = [
+                r["accuracy"]
+                for r in loo_results.values()
+                if np.isfinite(r["accuracy"])
+            ]
+            mape = f"{float(np.median(np.abs(vals))):.2g}%" if vals else "n/a"
+            mpe = f"{float(np.median(vals)):.2g}%" if vals else "n/a"
+            ann_text += (
+                f"<p style='{pstyle}10pt;'>Median abs error (≈magnitude) = {mape}"
+                f"<br/>Median error (≈bias) = {mpe}</p>"
+            )
         if ann_fit_data is not None:
             ann_text += (
                 f"<p style='{pstyle}10pt;'>Typical fit (median slope):"
@@ -2042,7 +2238,7 @@ class R3SettingsWidget(QtGui.QWidget):
                 f"<br />intercept = {intercept:.3g} ± {intercept_unc:.3g} (2SD)"
                 "</p>"
             )
-        if ann_fit_data:
+        if ann_fit_data or show_loo:
             ann.text = ann_text
 
         def _get_robust_ax_lims(data, margin=0.2, pad_factor=(1.0, 1.0)):
