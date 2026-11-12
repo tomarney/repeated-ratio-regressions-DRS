@@ -4,7 +4,7 @@
 #/ Authors: Thomas Arney
 #/ Description: Calibration by time-varying regressions of measured and reference molar ratios.
 #/ References: Tang et al. (2025, JAAS) DOI: 10.1039/D5JA00333D
-# / Version: 2.1.0
+#/ Version: 2.1.1
 #/ Contact: t.arney@soton.ac.uk
 
 
@@ -482,18 +482,99 @@ def interpolate_regression_parameters(reg_data, target_times, spline_type):
     )
 
 
+def _fit_global_selection_group_odr(analyte, norm, mode, rm_names):
+    """Fit one session-wide ODR using one aggregate point per RM selection group."""
+    rm_data = []
+    valid_names = []
+    for rm_name in rm_names:
+        try:
+            stats = gather_ratio_stats(
+                analyte, norm, mode, rm_group=data.selectionGroup(rm_name)
+            )
+        except Exception:
+            stats = None
+        if not stats:
+            continue
+        meas_mean, ref_val, meas_2sd, ref_2sd = stats
+        vals = np.asarray([meas_mean, ref_val, meas_2sd, ref_2sd], dtype=float)
+        if not np.all(np.isfinite(vals)):
+            continue
+        # Convert to 1-sigma uncertainties for ODR
+        x_err = _check_and_fix_uncertainty(float(meas_mean), float(meas_2sd) / 2.0)
+        y_err = _check_and_fix_uncertainty(float(ref_val), float(ref_2sd) / 2.0)
+        if x_err is None or y_err is None:
+            continue
+        rm_data.append((float(meas_mean), float(ref_val), x_err, y_err))
+        valid_names.append(rm_name)
+    if len(rm_data) < 2:
+        return None
+    x, y, x_err, y_err = (np.asarray(v, dtype=float) for v in zip(*rm_data))
+    try:
+        fit = fit_odr(x, y, x_err, y_err)
+        sd_beta = np.asarray(fit.sd_beta, dtype=float)
+        beta = np.asarray(fit.beta, dtype=float)
+        return {
+            "slope": float(beta[0]),
+            "intercept": float(beta[1]),
+            "slope_se": float(sd_beta[0]),
+            "intercept_se": float(sd_beta[1]),
+            "rm_names": valid_names,
+        }
+    except Exception as e:
+        IoLog.warning(f"Global selection-group ODR failed: {e}")
+        return None
+
+
 def calculate_global_loo(
     blocks, analyte, norm, mode, selected_rms, min_rms, spline_type, index_channel
 ):
-    """Omit each RM session-wide, refit blocks, and predict omitted selections."""
+    """
+    Omit each RM session-wide (Leave-one-out, LOO) and calculate accuracy and ODR influence.
+
+    Influence is calculated as the sum of squared differences from the full fit in slope and intercept,
+    each normalised by the standard error of the slope/intercept from the full fit.
+    See "Regression Diagnostics: Identifying Influential Data and Sources of Collinearity" (Belsley et al., 1980)
+    """
     out = _get_output_name(analyte, norm, mode)
     it = np.asarray(index_channel.time(), float)
     ans = {}
+
+    # This session-wide fit (based on mean RM values) gives the baseline parameters
+    # for the influence calculation. Not used for the LOO accuracy calculation,
+    # which needs to use the time-varying fits to account for drift.
+    full_fit = _fit_global_selection_group_odr(analyte, norm, mode, selected_rms)
+
     for omitted in selected_rms:
         train = [r for r in selected_rms if r != omitted]
         fits = fit_regressions_for_all_blocks(
             blocks, [analyte], norm, mode, min_rms, {out: train}, log_warnings=False
         )
+        loo_fit = _fit_global_selection_group_odr(analyte, norm, mode, train)
+
+        influence = np.nan
+        if full_fit is not None and loo_fit is not None:
+            m_se = full_fit["slope_se"]
+            c_se = full_fit["intercept_se"]
+            if np.isfinite(m_se) and np.isfinite(c_se) and m_se > 0.0 and c_se > 0.0:
+                influence = 0.5 * (
+                    ((full_fit["slope"] - loo_fit["slope"]) / m_se) ** 2
+                    + ((full_fit["intercept"] - loo_fit["intercept"]) / c_se) ** 2
+                )
+
+        ans[omitted] = {
+            "prediction": np.nan,
+            "accuracy": np.nan,
+            "influence": float(influence),
+            "loo_slope": np.nan if loo_fit is None else loo_fit["slope"],
+            "loo_intercept": np.nan if loo_fit is None else loo_fit["intercept"],
+            "full_slope": np.nan if full_fit is None else full_fit["slope"],
+            "full_intercept": np.nan if full_fit is None else full_fit["intercept"],
+            "full_slope_se": np.nan if full_fit is None else full_fit["slope_se"],
+            "full_intercept_se": np.nan
+            if full_fit is None
+            else full_fit["intercept_se"],
+        }
+
         if analyte not in fits:
             continue
         try:
@@ -512,8 +593,9 @@ def calculate_global_loo(
             if not preds:
                 continue
             pred = float(np.mean(preds))
-            acc = np.nan if ref == 0 else ((pred - ref) / (ref)) * 100.0
-            ans[omitted] = {"prediction": pred, "accuracy": acc}
+            acc = np.nan if ref == 0 else ((pred - ref) / ref) * 100.0
+            ans[omitted]["prediction"] = pred
+            ans[omitted]["accuracy"] = acc
         except Exception as e:
             IoLog.warning(f"LOO failed for {out}/{omitted}: {e}")
     return ans
@@ -1165,6 +1247,8 @@ class R3SettingsWidget(QtGui.QWidget):
         drs.setSetting("MissingUnc2RSD", 10.0)
         drs.setSetting("MinRMsPerBlock", 2)
         drs.setSetting("BlockDetectionSensitivity", 1.0)
+        if drs.setting("InfluenceWarningThreshold") is None:
+            drs.setSetting("InfluenceWarningThreshold", 1.0)
         drs.setSetting("SplineType", "StepLinear")
 
         default_analytes = [ch for ch in self.allIsotopeChannels if ch != default_norm]
@@ -1463,7 +1547,7 @@ class R3SettingsWidget(QtGui.QWidget):
         rmHeaderLayout.setSpacing(0)
 
         rmNameHeader = QtGui.QLabel("Reference Material")
-        rmAccuracyHeader = QtGui.QLabel("LOO Accuracy")
+        rmAccuracyHeader = QtGui.QLabel("Accuracy")
 
         rmNameHeader.setStyleSheet("font-weight: bold;")
         rmAccuracyHeader.setStyleSheet("font-weight: bold;")
@@ -1474,44 +1558,53 @@ class R3SettingsWidget(QtGui.QWidget):
 
         rmLayout.addWidget(rmHeaderWidget)
 
-        # Two independent lists, side by side
-        rmListsWidget = QtGui.QWidget()
-        rmListsLayout = QtGui.QHBoxLayout(rmListsWidget)
-        rmListsLayout.setContentsMargins(0, 0, 0, 0)
-        rmListsLayout.setSpacing(0)
+        # RM table
+        rmTableWidget = QtGui.QWidget()
+        rmTableLayout = QtGui.QHBoxLayout(rmTableWidget)
+        rmTableLayout.setContentsMargins(0, 0, 0, 0)
+        rmTableLayout.setSpacing(0)
 
-        # Original RM list
+        # RM list
         self.previewRMsList = QtGui.QListWidget(self.contentWidget)
         self.previewRMsList.setSelectionMode(QtGui.QAbstractItemView.NoSelection)
         self.previewRMsList.setMinimumHeight(200)
-        self.previewRMsList.setFixedWidth(200)
+        self.previewRMsList.setMinimumWidth(120)
 
-        # New accuracy column
+        # influence column
+        self.previewInfluenceList = QtGui.QListWidget(self.contentWidget)
+        self.previewInfluenceList.setSelectionMode(QtGui.QAbstractItemView.NoSelection)
+        self.previewInfluenceList.setFocusPolicy(Qt.NoFocus)
+        self.previewInfluenceList.setFixedWidth(22)
+        self.previewInfluenceList.setFont(self.previewRMsList.font)
+        self.previewInfluenceList.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.previewInfluenceList.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.previewInfluenceList.setFrameShape(QtGui.QFrame.NoFrame)
+
+        # accuracy column
         self.previewAccuracyList = QtGui.QListWidget(self.contentWidget)
         self.previewAccuracyList.setSelectionMode(QtGui.QAbstractItemView.NoSelection)
         self.previewAccuracyList.setFocusPolicy(Qt.NoFocus)
-        self.previewAccuracyList.setFixedWidth(50)
-
         self.previewAccuracyList.setFont(self.previewRMsList.font)
-
-        # Prevent independent vertical scrolling
         self.previewAccuracyList.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        # Avoid a second visible frame
         self.previewAccuracyList.setFrameShape(QtGui.QFrame.NoFrame)
 
-        rmListsLayout.addWidget(self.previewRMsList, 1)
-        rmListsLayout.addWidget(self.previewAccuracyList)
+        rmTableLayout.addWidget(self.previewRMsList)
+        rmTableLayout.addWidget(self.previewInfluenceList, 1)
+        rmTableLayout.addWidget(self.previewAccuracyList)
 
-        rmLayout.addWidget(rmListsWidget)
+        rmLayout.addWidget(rmTableWidget)
 
-        # Synchronise scrolling
+        # Synchronise scrolling from the primary RM list
         self.previewRMsList.verticalScrollBar().valueChanged.connect(
             self.previewAccuracyList.verticalScrollBar().setValue
+        )
+        self.previewRMsList.verticalScrollBar().valueChanged.connect(
+            self.previewInfluenceList.verticalScrollBar().setValue
         )
 
         # Match row spacing
         self.previewAccuracyList.setSpacing(self.previewRMsList.spacing)
+        self.previewInfluenceList.setSpacing(self.previewRMsList.spacing)
 
         self.missingUncLabel = QtGui.QLabel("* missing uncertainty in ref. value")
         self.missingUncLabel.setStyleSheet("font-style: italic; font-size: 9pt;")
@@ -1530,6 +1623,40 @@ class R3SettingsWidget(QtGui.QWidget):
         self.resetBtn = QtGui.QPushButton("Reset all ratios")
         self.resetBtn.setToolTip("Select all RMs for all ratios")
         rmLayout.addWidget(self.resetBtn)
+
+        # influence controls
+        influenceLayout = QtGui.QVBoxLayout()
+        influenceLayout.addSpacing(10)
+        influenceLayout.setSpacing(2)
+
+        influenceLegend = QtGui.QLabel(
+            "<span style='color:#f28c28;'>▲</span>&nbsp;=&nbsp;High influence over the regression"
+        )
+        influenceLegend.setTextFormat(Qt.RichText)
+        influenceLegend.setToolTip(
+            "Cook's distance–like standardized influence diagnostic.\n"
+            "Measures the change in the ODR slope and intercept when each RM\n"
+            "is omitted, normalized by the standard errors of the full fit.\n"
+            "Values above the threshold indicate high influence."
+        )
+        influenceLayout.addWidget(influenceLegend)
+
+        influenceControlsLayout = QtGui.QHBoxLayout()
+        influenceControlsLayout.addWidget(QtGui.QLabel("Warning threshold:"))
+        self.influenceSensitivitySpinBox = QtGui.QDoubleSpinBox()
+        self.influenceSensitivitySpinBox.setRange(0.1, 100.0)
+        self.influenceSensitivitySpinBox.setSingleStep(0.1)
+        self.influenceSensitivitySpinBox.setDecimals(1)
+        self.influenceSensitivitySpinBox.setValue(
+            float(drs.setting("InfluenceWarningThreshold") or 1.0)
+        )
+        self.influenceSensitivitySpinBox.setToolTip(
+            "Number of standard errors of the regression slope and intercept.\n"
+            "RMs with influence above this threshold are flagged."
+        )
+        influenceControlsLayout.addWidget(self.influenceSensitivitySpinBox)
+        influenceLayout.addLayout(influenceControlsLayout)
+        rmLayout.addLayout(influenceLayout)
 
         # Missing uncertainty controls
         uncCtrlLayout = QtGui.QVBoxLayout()
@@ -1551,15 +1678,14 @@ class R3SettingsWidget(QtGui.QWidget):
         uncCtrlLayout.addLayout(uncInputLayout)
         rmLayout.addLayout(uncCtrlLayout)
 
-        plotAreaLayout.addLayout(rmLayout)
+        plotAreaLayout.addLayout(rmLayout, 1)
         plotAreaLayout.addSpacing(30)
 
         # Right hand side plot
         PLOT.setMinimumHeight(500)
         PLOT.setMaximumHeight(700)
         PLOT.setMinimumWidth(500)
-        PLOT.setMaximumWidth(700)
-        plotAreaLayout.addWidget(PLOT, 1)
+        plotAreaLayout.addWidget(PLOT, 3)
 
         self.mainLayout.addWidget(previewGroup)
         self.mainLayout.addSpacing(20)
@@ -1685,6 +1811,12 @@ class R3SettingsWidget(QtGui.QWidget):
         self.selAllBtn.clicked.connect(lambda: self.set_all_rms_checked(True))
         self.deSelAllBtn.clicked.connect(lambda: self.set_all_rms_checked(False))
         self.resetBtn.clicked.connect(self.reset_all_ratios)
+        self.influenceSensitivitySpinBox.valueChanged.connect(
+            lambda v: (
+                drs.setSetting("InfluenceWarningThreshold", float(v)),
+                self.refresh_plot(),
+            )
+        )
         self.fixUncCheck.toggled.connect(self.update_unc_fix_state)
         self.uncSpinBox.valueChanged.connect(
             lambda v: (drs.setSetting("MissingUnc2RSD", float(v)), self.refresh_plot())
@@ -1838,6 +1970,7 @@ class R3SettingsWidget(QtGui.QWidget):
         self.previewRMsList.blockSignals(True)
         self.previewRMsList.clear()
         self.previewAccuracyList.clear()
+        self.previewInfluenceList.clear()
 
         combo_data = self.previewRatioSelector.currentData
         if not combo_data:
@@ -1913,7 +2046,13 @@ class R3SettingsWidget(QtGui.QWidget):
 
             self.previewAccuracyList.addItem(accuracy_item)
 
-            # Identical row heights in both lists.
+            influence_item = QtGui.QListWidgetItem("")
+            influence_item.setTextAlignment(Qt.AlignCenter)
+            influence_item.setFlags(Qt.NoItemFlags)
+            influence_item.setForeground(QtGui.QColor(242, 140, 40))
+            self.previewInfluenceList.addItem(influence_item)
+
+            # Identical row heights in all three lists.
             row_height = (
                 max(
                     self.previewRMsList.fontMetrics().height(),
@@ -1927,6 +2066,7 @@ class R3SettingsWidget(QtGui.QWidget):
 
             item.setSizeHint(row_size)
             accuracy_item.setSizeHint(row_size)
+            influence_item.setSizeHint(row_size)
 
         self.missingUncLabel.setVisible(has_missing_unc_any)
         self.fixUncCheck.setEnabled(has_missing_unc_any)
@@ -1936,25 +2076,35 @@ class R3SettingsWidget(QtGui.QWidget):
         self.refresh_plot()
 
     def update_loo_accuracy_labels(self, loo_results):
-        """Update the separate LOO accuracy column."""
+        """Update LOO accuracy and the separate influence-warning column."""
+        threshold = float(drs.setting("InfluenceWarningThreshold") or 1.0)
 
         for i in range(self.previewRMsList.count):
             rm_item = self.previewRMsList.item(i)
             accuracy_item = self.previewAccuracyList.item(i)
-
+            influence_item = self.previewInfluenceList.item(i)
             name = rm_item.data(Qt.UserRole)
             result = loo_results.get(name)
 
             if result and np.isfinite(result["accuracy"]):
                 accuracy_text = f"{result['accuracy']:.2g}%"
-
             elif rm_item.checkState() == Qt.Checked:
                 accuracy_text = "n/a"
-
             else:
                 accuracy_text = ""
-
             accuracy_item.setText(accuracy_text)
+
+            flagged = bool(
+                result
+                and np.isfinite(result.get("influence", np.nan))
+                and np.isfinite(threshold)
+                and result["influence"] > threshold
+            )
+            influence_item.setText("▲" if flagged else "")
+            if result and np.isfinite(result.get("influence", np.nan)):
+                influence_item.setToolTip(f"Influence = {result['influence']:.3g}")
+            else:
+                influence_item.setToolTip("")
 
     def refresh_plot(self):
         """Update the regression preview plot after user changes inputs"""
@@ -2066,15 +2216,14 @@ class R3SettingsWidget(QtGui.QWidget):
             else int(view_text.split(":")[-1].strip()) - 1
         )
 
-        x_unc_label = "2SD" if (show_loo or show_overview) else "2SE"
+        x_unc_label = " (±2SD)" if show_loo else "" if show_overview else " (±2SE)"
+        y_unc_label = "" if show_overview else " (±2SD)"
         if mode == "Delta notation":
-            PLOT.left().label = f"Reference {out_name} (‰) (±2SD)"
-            PLOT.bottom().label = (
-                f"Measured {target_ch}/{norm_channel} (±{x_unc_label})"
-            )
+            PLOT.left().label = f"Reference {out_name} (‰) {y_unc_label}"
+            PLOT.bottom().label = f"Measured {target_ch}/{norm_channel} {x_unc_label}"
         else:
-            PLOT.left().label = f"Reference {out_name} (±2SD)"
-            PLOT.bottom().label = f"Measured {out_name} (±{x_unc_label})"
+            PLOT.left().label = f"Reference {out_name} {y_unc_label}"
+            PLOT.bottom().label = f"Measured {out_name} {x_unc_label}"
 
         def plot_point_with_error(x, y, x_err, y_err, color, size, hollow=True):
             g = PLOT.addGraph()
@@ -2112,6 +2261,41 @@ class R3SettingsWidget(QtGui.QWidget):
         # plot/replot the data
         ann_fit_data = None
         if show_loo:
+            full_fit = next(
+                (
+                    r
+                    for r in loo_results.values()
+                    if np.isfinite(r.get("full_slope", np.nan))
+                    and np.isfinite(r.get("full_intercept", np.nan))
+                ),
+                None,
+            )
+            if full_fit is not None:
+                full_x = []
+                for rm_name in selected_rms:
+                    st = gather_ratio_stats(
+                        target_ch,
+                        norm_channel,
+                        mode,
+                        rm_group=data.selectionGroup(rm_name),
+                    )
+                    if st and np.isfinite(st[0]):
+                        full_x.append(float(st[0]))
+                if full_x:
+                    min_x = np.min(full_x)
+                    max_x = np.max(full_x)
+                    x_line = np.linspace(min(0, min_x) * 10, max_x * 10, 50)
+                    if mode == "Delta notation":
+                        x_range = np.linspace(-max_x * 10, max_x * 10, 50)
+                    y_line = (
+                        full_fit["full_slope"] * x_line + full_fit["full_intercept"]
+                    )
+                    fg = PLOT.addGraph()
+                    pen = QPen(QtGui.QColor(70, 70, 70))
+                    pen.setWidth(1.5)
+                    fg.pen = pen
+                    fg.setData(x_line, y_line)
+
             for rm_name in selected_rms:
                 st = gather_ratio_stats(
                     target_ch, norm_channel, mode, rm_group=data.selectionGroup(rm_name)
@@ -2133,7 +2317,7 @@ class R3SettingsWidget(QtGui.QWidget):
                         st[0], st[1], st[2], st[3], get_color(rm_name), 7.0, False
                     )
         elif show_overview:
-            # Showing overview, so plot all block results plus means
+            # Showing overview, so plot all block results
             for line in block_fit_lines:
                 fg = PLOT.addGraph()
                 pen = QPen(line["color"])
@@ -2147,24 +2331,6 @@ class R3SettingsWidget(QtGui.QWidget):
                     plot_point_with_error(
                         meas_mean, ref_val, 0, 0, get_color(name), 6.0, True
                     )
-
-            for rm_name in selected_rms:
-                stats = gather_ratio_stats(
-                    target_ch, norm_channel, mode, rm_group=data.selectionGroup(rm_name)
-                )
-                if not stats:
-                    continue
-
-                meas_mean, ref_val, meas_err, ref_err = stats
-                plot_point_with_error(
-                    meas_mean,
-                    ref_val,
-                    meas_err,
-                    ref_err,
-                    get_color(rm_name),
-                    6.0,
-                    False,
-                )
 
             if block_fit_lines:
                 ann_fit_data = sorted(block_fit_lines, key=lambda x: x["slope"])[
@@ -2222,6 +2388,8 @@ class R3SettingsWidget(QtGui.QWidget):
             ann_text += (
                 f"<p style='{pstyle}10pt;'>Median abs error (≈magnitude) = {mape}"
                 f"<br/>Median error (≈bias) = {mpe}</p>"
+                f"<p style='{pstyle}8pt;'>Line = ODR fit using all RMs"
+                f"<br />X = predicted value of each RM if left out of the fit</p>"
             )
         if ann_fit_data is not None:
             ann_text += (
